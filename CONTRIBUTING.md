@@ -10,5 +10,5 @@ explicit tickets. Workflow:
    granularity convention (max commit distribution: small, reviewable,
    individually buildable commits rather than large drops).
 5. When the ticket satisfies `docs/DEFINITION_OF_DONE.md`, mark it `done`.
-6. The same commits are mirrored into the combined `impossible-computer`
+6. The same commits are mirrored into the combined `arrakis`
    repo under this repo's subdirectory.

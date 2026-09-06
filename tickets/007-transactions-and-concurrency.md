@@ -21,5 +21,5 @@ snapshots.
 - Write-write conflict detection under Snapshot Isolation (first-committer-
   wins or similar).
 
-Not started. This is the natural on-ramp to Phase 6 (`impossible-database`),
+Not started. This is the natural on-ramp to Phase 6 (`choam`),
 which needs real transactions and MVCC on top of this exact storage engine.
