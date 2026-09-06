@@ -13,15 +13,18 @@ repo commit-for-commit.
 
 ## Status
 
-**Phase 2 — ACTIVE.** Slice 1 (tickets 001–003) is real and tested: a
-checksummed, append-only, multi-segment log with crash recovery that
-survives corruption injected at *every* byte offset of a real file (see
-`crates/storage/tests/crash_recovery.rs`), and PUT/GET/DELETE/SCAN/SNAPSHOT
-primitives with genuine multi-version reads, exposed through the `vaultc`
-CLI. See [docs/design/STORAGE.md](docs/design/STORAGE.md) for the
-architecture and [tickets/](tickets/) for what's still open — an on-disk
-B+Tree index, a buffer manager, compaction, transactions/concurrency, and
-group commit (tickets 004–008) — before this phase closes.
+**Phase 2 — ACTIVE.** Tickets 001–004 are done: a checksummed, append-only,
+multi-segment log with crash recovery that survives corruption injected at
+*every* byte offset of a real file (`crates/storage/tests/crash_recovery.rs`);
+PUT/GET/DELETE/SCAN/SNAPSHOT primitives with genuine multi-version reads,
+exposed through the `vaultc` CLI; and now a 4096-byte slotted page format
+plus a buffer pool (clock eviction, pinning, dirty tracking) built on the
+same crash-safe log, with its own crash-injection and property-based tests
+(`tests/page_crash_recovery.rs`, `tests/page_and_buffer_property.rs`). See
+[docs/design/STORAGE.md](docs/design/STORAGE.md) for the architecture and
+[tickets/](tickets/) for what's still open — the on-disk B+Tree index that
+will actually use these pages, compaction, transactions/concurrency, and
+group commit (tickets 005–008) — before this phase closes.
 
 ## The constraint
 
