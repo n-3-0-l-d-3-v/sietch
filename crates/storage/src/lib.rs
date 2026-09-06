@@ -5,11 +5,17 @@
 //! carefully-scoped exception (discarding an uncommitted torn tail after a
 //! crash, which is recovery, not mutation).
 
+pub mod buffer;
 pub mod log;
+pub mod page;
+pub mod page_store;
 pub mod record;
 pub mod segment;
 pub mod store;
 
+pub use buffer::{BufferError, BufferPool};
 pub use log::{Log, LogError, OpenReport};
+pub use page::{Page, PageError, PageType, SlotId, PAGE_SIZE};
+pub use page_store::{LogPageStore, LogPageStoreError, MemPageStore, PageId, PageStore};
 pub use record::{Record, RecordType};
 pub use store::{Snapshot, Store, StoreError};
