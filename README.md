@@ -9,11 +9,15 @@ repo commit-for-commit.
 
 ## Status
 
-**Phase 2 — QUEUED**
-
-See [tickets/](tickets/) for the live phase-by-phase ticket board and
-[docs/design/](docs/design/) for constraints, invariants and architecture
-decision records.
+**Phase 2 — ACTIVE.** Slice 1 (tickets 001–003) is real and tested: a
+checksummed, append-only, multi-segment log with crash recovery that
+survives corruption injected at *every* byte offset of a real file (see
+`crates/storage/tests/crash_recovery.rs`), and PUT/GET/DELETE/SCAN/SNAPSHOT
+primitives with genuine multi-version reads, exposed through the `vaultc`
+CLI. See [docs/design/STORAGE.md](docs/design/STORAGE.md) for the
+architecture and [tickets/](tickets/) for what's still open — an on-disk
+B+Tree index, a buffer manager, compaction, transactions/concurrency, and
+group commit (tickets 004–008) — before this phase closes.
 
 ## The constraint
 
@@ -29,7 +33,7 @@ Versioning, MVCC, append-only logs, page/segment design, and a real compaction a
 
 ## Sibling repositories
 
-- [impossible-machine](https://github.com/n-3-0-l-d-3-v/impossible-machine) — THE MACHINE (ACTIVE)
+- [impossible-machine](https://github.com/n-3-0-l-d-3-v/impossible-machine) — THE MACHINE (COMPLETE)
 - [impossible-language](https://github.com/n-3-0-l-d-3-v/impossible-language) — THE LANGUAGE (QUEUED)
 - [impossible-kernel](https://github.com/n-3-0-l-d-3-v/impossible-kernel) — THE KERNEL (QUEUED)
 - [impossible-database](https://github.com/n-3-0-l-d-3-v/impossible-database) — THE DATABASE (QUEUED)
