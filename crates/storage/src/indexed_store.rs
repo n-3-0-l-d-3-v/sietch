@@ -26,6 +26,15 @@ use crate::log::{Log, LogError};
 use crate::record::{Record, RecordType};
 
 const DEFAULT_POOL_CAPACITY: usize = 256;
+/// How many put/delete operations happen between automatic sentinel
+/// checkpoints. A larger interval means fewer B+Tree writes per
+/// operation (the sentinel update is itself a full root-to-leaf insert)
+/// at the cost of replaying up to `interval - 1` extra log records on
+/// reopen after an unclean shutdown — the same latency/throughput trade
+/// ticket 008 (group commit) makes for `fsync`, applied here to
+/// checkpointing instead. See
+/// `docs/design/decisions/ADR-006-checkpoint-batching.md`.
+const DEFAULT_CHECKPOINT_INTERVAL: usize = 128;
 
 /// A live key's current value, or the fact that it's a tombstone/missing
 /// resolved away — `scan`'s external return shape.
@@ -57,6 +66,8 @@ pub struct IndexedStore {
     /// rather than trusting it silently.
     pub reconciled_records: usize,
     pub recovered_from_torn_tail: bool,
+    checkpoint_interval: usize,
+    pending_since_checkpoint: usize,
 }
 
 fn user_key(key: &[u8]) -> Vec<u8> {
@@ -99,12 +110,20 @@ fn decode_index_value(bytes: &[u8]) -> Option<Vec<u8>> {
 
 impl IndexedStore {
     pub fn open(dir: impl Into<PathBuf>) -> Result<Self, IndexedStoreError> {
-        Self::open_with_pool_capacity(dir, DEFAULT_POOL_CAPACITY)
+        Self::open_with_options(dir, DEFAULT_POOL_CAPACITY, DEFAULT_CHECKPOINT_INTERVAL)
     }
 
     pub fn open_with_pool_capacity(
         dir: impl Into<PathBuf>,
         pool_capacity: usize,
+    ) -> Result<Self, IndexedStoreError> {
+        Self::open_with_options(dir, pool_capacity, DEFAULT_CHECKPOINT_INTERVAL)
+    }
+
+    pub fn open_with_options(
+        dir: impl Into<PathBuf>,
+        pool_capacity: usize,
+        checkpoint_interval: usize,
     ) -> Result<Self, IndexedStoreError> {
         let dir = dir.into();
         let (log, log_report) = Log::open(dir.join("log"))?;
@@ -120,6 +139,14 @@ impl IndexedStore {
             }
         }
         if reconciled_records > 0 {
+            // Catching up moves the checkpoint forward too — otherwise a
+            // second reopen with no new writes would redundantly replay
+            // the same already-reconciled records again (harmless, since
+            // applying a Put/Delete twice is idempotent, but pointless).
+            index.insert(
+                meta_key(&LAST_INDEXED_SEQ_KEY).to_vec(),
+                log.next_seq().to_le_bytes().to_vec(),
+            )?;
             index.flush()?;
         }
 
@@ -128,6 +155,8 @@ impl IndexedStore {
             index,
             reconciled_records,
             recovered_from_torn_tail: log_report.recovered_from_torn_tail,
+            checkpoint_interval: checkpoint_interval.max(1),
+            pending_since_checkpoint: 0,
         })
     }
 
@@ -151,11 +180,27 @@ impl IndexedStore {
 
     fn apply_and_advance(&mut self, record: &Record) -> Result<(), IndexedStoreError> {
         apply_record_to_index(&mut self.index, record)?;
+        self.pending_since_checkpoint += 1;
+        if self.pending_since_checkpoint >= self.checkpoint_interval {
+            self.checkpoint()?;
+        }
+        Ok(())
+    }
+
+    /// Durably records "everything up to the current log position is
+    /// reflected in the index" and flushes any pages still dirty in the
+    /// buffer pool. Called automatically every `checkpoint_interval`
+    /// operations; call it explicitly before a graceful shutdown if you
+    /// want the next `open` to need zero reconciliation regardless of
+    /// where the operation count last landed relative to the interval.
+    pub fn checkpoint(&mut self) -> Result<(), IndexedStoreError> {
+        let next_seq = self.log.next_seq();
         self.index.insert(
             meta_key(&LAST_INDEXED_SEQ_KEY).to_vec(),
-            (record.seq + 1).to_le_bytes().to_vec(),
+            next_seq.to_le_bytes().to_vec(),
         )?;
         self.index.flush()?;
+        self.pending_since_checkpoint = 0;
         Ok(())
     }
 
@@ -189,9 +234,10 @@ impl IndexedStore {
         Ok(out)
     }
 
+    /// Alias for `checkpoint` — ensures durability and a zero-reconciliation
+    /// next `open`, whatever the pending operation count.
     pub fn flush(&mut self) -> Result<(), IndexedStoreError> {
-        self.index.flush()?;
-        Ok(())
+        self.checkpoint()
     }
 }
 
@@ -256,6 +302,10 @@ mod tests {
             let mut store = IndexedStore::open(dir.path()).unwrap();
             store.put("a", "1").unwrap();
             store.put("b", "2").unwrap();
+            // A graceful shutdown checkpoints explicitly, the same way a
+            // real caller would before closing — checkpointing isn't
+            // automatic until `checkpoint_interval` operations accrue.
+            store.checkpoint().unwrap();
         }
         let store = IndexedStore::open(dir.path()).unwrap();
         assert_eq!(
@@ -273,6 +323,7 @@ mod tests {
         {
             let mut store = IndexedStore::open(dir.path()).unwrap();
             store.put("a", "1").unwrap(); // fully applied: log + index
+            store.checkpoint().unwrap(); // establishes a clean baseline before the bypass below
             let record = store.log.append_put(b"b".to_vec(), b"2".to_vec()).unwrap();
             let _ = record; // log committed "b" -> "2"; index was never told
         }
@@ -298,7 +349,8 @@ mod tests {
             for i in 0..50u32 {
                 store.put(format!("k{i}"), format!("v{i}")).unwrap();
             }
-            // Two more records committed to the log only.
+            store.checkpoint().unwrap(); // establishes a clean baseline before the bypass below
+                                         // Two more records committed to the log only.
             store
                 .log
                 .append_put(b"unindexed1".to_vec(), b"x".to_vec())
@@ -313,5 +365,46 @@ mod tests {
             store.reconciled_records, 2,
             "only the two records the index never saw should be replayed, not all 52"
         );
+    }
+
+    #[test]
+    fn automatic_checkpointing_bounds_reconciliation_to_the_interval_not_the_whole_history() {
+        let dir = tempdir().unwrap();
+        {
+            // A small interval makes the automatic checkpoint boundary
+            // deterministic and easy to reason about in a test.
+            let mut store = IndexedStore::open_with_options(dir.path(), 64, 5).unwrap();
+            for i in 0..12u32 {
+                store.put(format!("k{i}"), format!("v{i}")).unwrap();
+            }
+            // No explicit final checkpoint: simulates an unclean shutdown
+            // right after the 12th operation. Automatic checkpoints will
+            // have fired after operations 5 and 10, so only ops 11 and 12
+            // should need reconciliation.
+        }
+        let store = IndexedStore::open_with_options(dir.path(), 64, 5).unwrap();
+        assert_eq!(
+            store.reconciled_records, 2,
+            "only operations since the last automatic checkpoint (at op 10) should be replayed"
+        );
+    }
+
+    #[test]
+    fn all_values_are_correct_regardless_of_where_a_crash_lands_relative_to_a_checkpoint() {
+        let dir = tempdir().unwrap();
+        {
+            let mut store = IndexedStore::open_with_options(dir.path(), 64, 5).unwrap();
+            for i in 0..23u32 {
+                store.put(format!("k{i}"), format!("v{i}")).unwrap();
+            }
+            // Deliberately no final checkpoint.
+        }
+        let mut store = IndexedStore::open_with_options(dir.path(), 64, 5).unwrap();
+        for i in 0..23u32 {
+            assert_eq!(
+                store.get(format!("k{i}").as_bytes()).unwrap(),
+                Some(format!("v{i}").into_bytes())
+            );
+        }
     }
 }
