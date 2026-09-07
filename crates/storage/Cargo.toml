@@ -20,3 +20,7 @@ harness = false
 [[bench]]
 name = "buffer_pool"
 harness = false
+
+[[bench]]
+name = "btree"
+harness = false
