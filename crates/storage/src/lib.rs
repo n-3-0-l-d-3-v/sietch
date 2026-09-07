@@ -7,6 +7,7 @@
 
 pub mod btree;
 pub mod buffer;
+pub mod heap_page_store;
 pub mod indexed_store;
 pub mod log;
 pub mod page;
@@ -17,6 +18,7 @@ pub mod store;
 
 pub use btree::{BTree, BTreeError};
 pub use buffer::{BufferError, BufferPool};
+pub use heap_page_store::{HeapPageStore, HeapPageStoreError};
 pub use indexed_store::{IndexedStore, IndexedStoreError};
 pub use log::{Log, LogError, OpenReport};
 pub use page::{Page, PageError, PageType, SlotId, PAGE_SIZE};
