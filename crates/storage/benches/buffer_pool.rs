@@ -72,5 +72,10 @@ fn bench_eviction_flushes_dirty_pages_to_disk(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_cache_hit_fetch, bench_eviction_under_pressure, bench_eviction_flushes_dirty_pages_to_disk);
+criterion_group!(
+    benches,
+    bench_cache_hit_fetch,
+    bench_eviction_under_pressure,
+    bench_eviction_flushes_dirty_pages_to_disk
+);
 criterion_main!(benches);
