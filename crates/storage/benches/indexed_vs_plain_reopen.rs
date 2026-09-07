@@ -12,7 +12,7 @@ use tempfile::tempdir;
 
 fn bench_plain_store_reopen(c: &mut Criterion) {
     let mut group = c.benchmark_group("reopen_after_clean_shutdown");
-    for count in [100usize, 1_000, 10_000] {
+    for count in [100usize, 1_000, 10_000, 30_000] {
         let dir = tempdir().unwrap();
         {
             let mut store = Store::open(dir.path()).unwrap();
@@ -31,7 +31,7 @@ fn bench_plain_store_reopen(c: &mut Criterion) {
 
 fn bench_indexed_store_reopen(c: &mut Criterion) {
     let mut group = c.benchmark_group("reopen_after_clean_shutdown");
-    for count in [100usize, 1_000, 10_000] {
+    for count in [100usize, 1_000, 10_000, 30_000] {
         let dir = tempdir().unwrap();
         {
             let mut store = IndexedStore::open(dir.path()).unwrap();
