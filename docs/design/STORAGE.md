@@ -15,6 +15,8 @@ Application (vaultc / Store API)
 
    -- parallel, page-oriented path over the same Log/Store --
 
+     BTree (real disk-oriented index: splits, multi-level growth)
+        |
 BufferPool (clock eviction, pinning, dirty tracking)
         |
    PageStore trait  --  MemPageStore (tests)  /  LogPageStore (real)
@@ -26,11 +28,12 @@ BufferPool (clock eviction, pinning, dirty tracking)
 
 This is deliberately built up in slices matching the full architecture in
 the project's design doc (`Application -> Logical objects -> Pages ->
-Buffer manager -> Append-only log -> Segments -> Host storage`). A
-disk-oriented B+Tree index is **not yet built** — see ticket 005, which
-will be the first real consumer of the page layer. The KV `Store`'s index
-is still rebuilt into memory on every open; that trade is explicit, not
-hidden (see "What this slice does not claim" below).
+Buffer manager -> Append-only log -> Segments -> Host storage`). The
+disk-oriented B+Tree index now exists and is real (verified at 20,000
+inserts / 3+ tree levels), but it is not yet wired in as the KV `Store`'s
+actual index — see ticket 011. The KV `Store`'s index is still rebuilt
+into memory on every open; that trade is explicit, not hidden (see "What
+this slice does not claim" below).
 
 ## The constraint, concretely
 
@@ -95,15 +98,36 @@ keyed by page id). That means page writes inherit the exact same crash
 guarantees as everything else in this store, verified directly in
 `tests/page_crash_recovery.rs`.
 
+## The B+Tree index
+
+`BTree` (`crates/storage/src/btree.rs`) is a real disk-oriented B+Tree
+built entirely on `Page`/`BufferPool`. Its meta page (a fixed, reserved
+page id) records the current root, so the tree survives a process
+restart. Every mutation decodes a node's entries, mutates a sorted `Vec`,
+and rebuilds the page from scratch — see
+`docs/design/decisions/ADR-003-btree-page-rebuild-strategy.md` for why,
+and for the measured per-insert cost that trade produces
+(`benches/btree.rs`). Node splits (both leaf and internal) propagate up
+correctly through multiple levels — proven at 20,000 inserts producing a
+3+ level tree with every key still retrievable — and the tree's behavior
+matches a reference `std::collections::BTreeMap` under both a large
+randomized differential test and a proptest property test over arbitrary
+insert sequences with upserts.
+
+What it does not yet do: delete/rebalance (ticket 009), bounded
+range scans via leaf sibling pointers instead of a full traversal (ticket
+010), or serve as `Store`'s actual index (ticket 011 — right now it's a
+correct, tested, benchmarked component that exists *alongside* `Store`,
+not yet wired into it).
+
 ## What this slice does not claim
 
-- No on-disk index (B+Tree) yet — both the KV `Store`'s index and, so far,
-  nothing above the page layer use it; pages exist but nothing is built on
-  top of them yet. The KV index is rebuilt into memory on every open by
+- The KV `Store`'s index is still rebuilt into memory on every open by
   replaying the whole log; fine for now, will not scale past the point
   where the log no longer fits comfortably in memory-rebuild time.
   Measured in `crates/storage/benches/append_throughput.rs`
-  (`store_reopen_recovery`). Ticket 005.
+  (`store_reopen_recovery`). `BTree` exists to fix this — ticket 011 does
+  the wiring.
 - No compaction yet, for keys or pages. Because nothing is ever
   overwritten, the log only grows — including superseded versions,
   tombstones, and every past version of every page (4096 bytes each,

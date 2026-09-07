@@ -13,18 +13,21 @@ repo commit-for-commit.
 
 ## Status
 
-**Phase 2 — ACTIVE.** Tickets 001–004 are done: a checksummed, append-only,
+**Phase 2 — ACTIVE.** Tickets 001–005 are done: a checksummed, append-only,
 multi-segment log with crash recovery that survives corruption injected at
 *every* byte offset of a real file (`crates/storage/tests/crash_recovery.rs`);
 PUT/GET/DELETE/SCAN/SNAPSHOT primitives with genuine multi-version reads,
-exposed through the `vaultc` CLI; and now a 4096-byte slotted page format
-plus a buffer pool (clock eviction, pinning, dirty tracking) built on the
-same crash-safe log, with its own crash-injection and property-based tests
-(`tests/page_crash_recovery.rs`, `tests/page_and_buffer_property.rs`). See
+exposed through the `vaultc` CLI; a 4096-byte slotted page format plus a
+buffer pool (clock eviction, pinning, dirty tracking); and now a real
+disk-oriented B+Tree index (`crates/storage/src/btree.rs`) with node
+splitting and multi-level growth, verified at 20,000 inserts (3+ tree
+levels) and differentially tested against `std::collections::BTreeMap`
+under both large randomized and property-based test sequences. See
 [docs/design/STORAGE.md](docs/design/STORAGE.md) for the architecture and
-[tickets/](tickets/) for what's still open — the on-disk B+Tree index that
-will actually use these pages, compaction, transactions/concurrency, and
-group commit (tickets 005–008) — before this phase closes.
+[tickets/](tickets/) for what's still open — B+Tree deletion/rebalancing,
+leaf sibling links for bounded range scans, wiring the B+Tree in as
+`Store`'s real index, compaction, transactions/concurrency, and group
+commit (tickets 006–011) — before this phase closes.
 
 ## The constraint
 
