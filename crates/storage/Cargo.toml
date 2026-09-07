@@ -24,3 +24,7 @@ harness = false
 [[bench]]
 name = "btree"
 harness = false
+
+[[bench]]
+name = "indexed_vs_plain_reopen"
+harness = false
