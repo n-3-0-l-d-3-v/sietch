@@ -38,6 +38,9 @@ fn bench_indexed_store_reopen(c: &mut Criterion) {
             for i in 0..count {
                 store.put(format!("k{i}"), format!("v{i}")).unwrap();
             }
+            // A graceful shutdown checkpoints explicitly (checkpointing is
+            // otherwise only automatic every `checkpoint_interval` ops).
+            store.checkpoint().unwrap();
         }
         group.bench_with_input(BenchmarkId::new("indexed_store", count), &dir, |b, dir| {
             b.iter(|| {
