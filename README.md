@@ -23,21 +23,24 @@ disk-oriented B+Tree index (`crates/storage/src/btree.rs`) with node
 splitting and multi-level growth, verified at 20,000 inserts (3+ tree
 levels) and differentially tested against `std::collections::BTreeMap`.
 
-**Ticket 011 produced a negative result worth reading, not a completion.**
-Wiring the B+Tree in as `Store`'s index (`IndexedStore`) was built,
-crash-tested, and differentially proven correct — but the benchmark it
-required showed reopening is ~12x *slower* than plain `Store`, not faster,
-because persisting pages through a generic `Store` means the index pays
-its own full-log-replay against a log inflated 200x+ by page-rebuild write
-amplification. Root cause and decision recorded in
-[ADR-004](docs/design/decisions/ADR-004-indexed-store-regression-and-write-amplification.md);
-the actual fix is ticket 012.
+**Tickets 011/012 are a full honest arc: regression, diagnosis, fix,
+partial win.** Wiring the B+Tree in as `Store`'s index (`IndexedStore`)
+was built, crash-tested, and differentially proven correct — but the
+first benchmark showed reopening ~12x *slower* than plain `Store`, root-
+caused in [ADR-004](docs/design/decisions/ADR-004-indexed-store-regression-and-write-amplification.md)
+to persisting pages through a generic `Store`. Ticket 012's
+`HeapPageStore` fixed that specific defect (data replayed at open time
+dropped ~111x, from 254.8x the main log to 2.3x —
+[ADR-005](docs/design/decisions/ADR-005-heap-page-store-fixes-the-reopen-regression.md)),
+though absolute reopen latency still doesn't conclusively beat plain
+`Store` at the sizes tested — reported exactly as measured, not rounded
+up to a win.
 
 See [docs/design/STORAGE.md](docs/design/STORAGE.md) for the architecture
-and [tickets/](tickets/) for what's still open — the ticket 012 fix,
-B+Tree deletion/rebalancing, leaf sibling links for bounded range scans,
-compaction, transactions/concurrency, and group commit (tickets 006–012)
-— before this phase closes.
+and [tickets/](tickets/) for what's still open — the remaining ticket 011
+optimization, B+Tree deletion/rebalancing, leaf sibling links for bounded
+range scans, compaction, transactions/concurrency, and group commit
+(tickets 006–011) — before this phase closes.
 
 ## The constraint
 

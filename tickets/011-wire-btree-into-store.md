@@ -8,36 +8,36 @@ phase: 2
 `Store` (tickets 001–003) rebuilds an in-memory `BTreeMap` index by
 replaying the entire log on every open. This ticket built `IndexedStore`
 (`crates/storage/src/indexed_store.rs`) to use the on-disk `BTree`
-(ticket 005) instead, on the hypothesis that reopening would then be fast.
+(ticket 005) instead.
 
-**The benchmark this ticket required disproved that hypothesis** — see
-`docs/design/decisions/ADR-004-indexed-store-regression-and-write-amplification.md`
-for the full analysis. `IndexedStore::open` is ~12x *slower* than plain
-`Store::open` at 10,000 entries, because persisting B+Tree pages through a
-generic `Store` (ADR-002's composition) means opening the index pays a
-*second* full-log-replay — against a log that's 200x+ larger than the
-original due to whole-page-rebuild write amplification (ADR-003).
+**History**: the first version (over `LogPageStore`) was measured ~12x
+*slower* to reopen than plain `Store` — see ADR-004. Ticket 012's
+`HeapPageStore` fixed that specific root cause (~111x reduction in data
+replayed at open time — ADR-005), but absolute reopen latency still
+doesn't clearly beat plain `Store` within the tested range (100–30,000
+entries). This ticket stays open, narrowed to the remaining cause.
 
-## What was actually delivered (and is correct, kept, tested)
-- [x] `IndexedStore`: put/get/delete/scan backed by the on-disk `BTree`,
-      with the durability log kept as the source of truth.
-- [x] Crash-consistent reconciliation: if the index falls behind the log
-      (an unclean shutdown between a log write committing and the
-      corresponding index write committing), reopening replays only the
-      unindexed tail, not the whole log — proven both by a targeted unit
-      test and by exhaustive byte-offset crash injection
-      (`tests/indexed_store_crash_recovery.rs`).
-- [x] Differential property test proving `IndexedStore` behaves identically
-      to plain `Store` for the same operations
-      (`tests/indexed_store_property.rs`).
-- [x] The decisive benchmark (`benches/indexed_vs_plain_reopen.rs`) — run
-      and reported honestly, including the negative result.
+## What was delivered and is correct, kept, tested
+- [x] `IndexedStore`: put/get/delete/scan backed by the on-disk `BTree`
+      over `HeapPageStore`, with the durability log as source of truth.
+- [x] Crash-consistent reconciliation (unindexed log tail replayed on
+      reopen after an unclean shutdown), proven by targeted tests and
+      exhaustive byte-offset crash injection.
+- [x] Differential property test proving identical behavior to plain
+      `Store` for the same operations.
+- [x] Two full rounds of the decisive benchmark, run and reported
+      honestly both times (ADR-004, ADR-005), including a negative result
+      the first time.
 
 ## What remains before this ticket can close
-- [ ] Fix the actual bottleneck identified in ADR-004 — see ticket 012.
-- [ ] Re-run `benches/indexed_vs_plain_reopen.rs` and confirm
-      `IndexedStore::open` is actually faster than `Store::open` at scale
-      before claiming the original goal is met.
+- [ ] Reduce writes-per-operation: `apply_and_advance` currently does two
+      B+Tree inserts per `put`/`delete` (the user key, and the
+      reconciliation sentinel key) — identified in ADR-005 as the likely
+      dominant remaining cost, now that nested full-replay is fixed. Batch
+      or otherwise avoid updating the sentinel on every single operation.
+- [ ] Re-run `benches/indexed_vs_plain_reopen.rs` after that change and
+      confirm `IndexedStore::open` is actually faster than `Store::open`
+      at scale before claiming this ticket's original goal is met.
 - [ ] Multi-version reads (`Snapshot`/`get_at`/`scan_at`) are still not
       implemented on `IndexedStore` at all — deferred, not yet even
       designed.
