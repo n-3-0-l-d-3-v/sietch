@@ -5,20 +5,24 @@
 //!
 //! Layout: `<dir>/log` holds the durability log (the source of truth for
 //! every write, unchanged from `Store`); `<dir>/index` holds the B+Tree's
-//! own pages (via `LogPageStore`, itself just another `Store` instance —
-//! composition, not a new persistence mechanism). This is a new on-disk
-//! layout, not backward compatible with a plain `Store`'s directory.
+//! own pages, via `HeapPageStore` (ticket 012) rather than the original
+//! `LogPageStore`. This is a new on-disk layout, not backward compatible
+//! with a plain `Store`'s directory.
 //!
-//! **Read this before assuming this is faster than `Store`**: it isn't,
-//! yet — see
-//! `docs/design/decisions/ADR-004-indexed-store-regression-and-write-amplification.md`
-//! for a measured 12x reopen-time regression and its root cause.
+//! **History**: the first version of this file used `LogPageStore` and
+//! was measured ~12x *slower* to reopen than plain `Store` at 10,000
+//! entries — see
+//! `docs/design/decisions/ADR-004-indexed-store-regression-and-write-amplification.md`.
+//! `HeapPageStore` (ticket 012) fixes the root cause (nested full-page
+//! replay); see
+//! `docs/design/decisions/ADR-005-heap-page-store-fixes-the-reopen-regression.md`
+//! for the re-measured result.
 
 use std::path::PathBuf;
 
 use crate::btree::{BTree, BTreeError};
+use crate::heap_page_store::{HeapPageStore, HeapPageStoreError};
 use crate::log::{Log, LogError};
-use crate::page_store::{LogPageStore, LogPageStoreError};
 use crate::record::{Record, RecordType};
 
 const DEFAULT_POOL_CAPACITY: usize = 256;
@@ -38,14 +42,14 @@ pub enum IndexedStoreError {
     #[error(transparent)]
     Log(#[from] LogError),
     #[error(transparent)]
-    Index(#[from] BTreeError<LogPageStoreError>),
+    Index(#[from] BTreeError<HeapPageStoreError>),
     #[error(transparent)]
-    PageStore(#[from] LogPageStoreError),
+    PageStore(#[from] HeapPageStoreError),
 }
 
 pub struct IndexedStore {
     log: Log,
-    index: BTree<LogPageStore>,
+    index: BTree<HeapPageStore>,
     /// True if, on open, the index was behind the log (an unclean
     /// shutdown between a log write committing and the corresponding
     /// index write committing) and had to be caught up by replaying the
@@ -104,7 +108,7 @@ impl IndexedStore {
     ) -> Result<Self, IndexedStoreError> {
         let dir = dir.into();
         let (log, log_report) = Log::open(dir.join("log"))?;
-        let page_store = LogPageStore::open(dir.join("index"))?;
+        let page_store = HeapPageStore::open(dir.join("index"))?;
         let mut index = BTree::open(page_store, pool_capacity)?;
 
         let last_indexed_seq = read_last_indexed_seq(&mut index)?;
@@ -191,7 +195,7 @@ impl IndexedStore {
     }
 }
 
-fn read_last_indexed_seq(index: &mut BTree<LogPageStore>) -> Result<u64, IndexedStoreError> {
+fn read_last_indexed_seq(index: &mut BTree<HeapPageStore>) -> Result<u64, IndexedStoreError> {
     match index.get(&meta_key(&LAST_INDEXED_SEQ_KEY))? {
         None => Ok(0),
         Some(bytes) => Ok(u64::from_le_bytes(bytes.try_into().unwrap())),
@@ -199,7 +203,7 @@ fn read_last_indexed_seq(index: &mut BTree<LogPageStore>) -> Result<u64, Indexed
 }
 
 fn apply_record_to_index(
-    index: &mut BTree<LogPageStore>,
+    index: &mut BTree<HeapPageStore>,
     record: &Record,
 ) -> Result<(), IndexedStoreError> {
     let value = match record.record_type {
