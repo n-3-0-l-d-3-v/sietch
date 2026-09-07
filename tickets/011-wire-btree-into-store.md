@@ -5,25 +5,39 @@ phase: 2
 
 # 011 — Wire the B+Tree in as Store's real persistent index
 
-`Store` (tickets 001–003) still rebuilds an in-memory `BTreeMap` index by
-replaying the entire log on every open (`store_reopen_recovery` in
-`benches/append_throughput.rs` already shows this cost growing with
-history size). `BTree` (ticket 005) is a real, tested, on-disk index that
-exists but isn't used by `Store` yet.
+`Store` (tickets 001–003) rebuilds an in-memory `BTreeMap` index by
+replaying the entire log on every open. This ticket built `IndexedStore`
+(`crates/storage/src/indexed_store.rs`) to use the on-disk `BTree`
+(ticket 005) instead, on the hypothesis that reopening would then be fast.
 
-## Scope
-- Replace (or offer as an alternative backend behind a shared trait —
-  decide and record as an ADR) `Store`'s in-memory index with `BTree` over
-  `LogPageStore`.
-- Multi-version reads (`Snapshot`/`get_at`/`scan_at`) need to keep working:
-  either the B+Tree stores version chains as its values, or a second
-  small index maps key -> version-chain head. Decide and document.
-- Benchmark open/recovery time before and after, on a large history, to
-  prove this actually fixes the scaling problem it's meant to fix — don't
-  just assert it.
-- This is a prerequisite for ticket 006 (compaction), since compaction
-  needs an efficient way to know which page versions are still reachable
-  from the current tree structure.
+**The benchmark this ticket required disproved that hypothesis** — see
+`docs/design/decisions/ADR-004-indexed-store-regression-and-write-amplification.md`
+for the full analysis. `IndexedStore::open` is ~12x *slower* than plain
+`Store::open` at 10,000 entries, because persisting B+Tree pages through a
+generic `Store` (ADR-002's composition) means opening the index pays a
+*second* full-log-replay — against a log that's 200x+ larger than the
+original due to whole-page-rebuild write amplification (ADR-003).
 
-Not started. This is the ticket that turns ticket 005's B+Tree from "a
-tested component that exists" into "the thing `Store` actually uses."
+## What was actually delivered (and is correct, kept, tested)
+- [x] `IndexedStore`: put/get/delete/scan backed by the on-disk `BTree`,
+      with the durability log kept as the source of truth.
+- [x] Crash-consistent reconciliation: if the index falls behind the log
+      (an unclean shutdown between a log write committing and the
+      corresponding index write committing), reopening replays only the
+      unindexed tail, not the whole log — proven both by a targeted unit
+      test and by exhaustive byte-offset crash injection
+      (`tests/indexed_store_crash_recovery.rs`).
+- [x] Differential property test proving `IndexedStore` behaves identically
+      to plain `Store` for the same operations
+      (`tests/indexed_store_property.rs`).
+- [x] The decisive benchmark (`benches/indexed_vs_plain_reopen.rs`) — run
+      and reported honestly, including the negative result.
+
+## What remains before this ticket can close
+- [ ] Fix the actual bottleneck identified in ADR-004 — see ticket 012.
+- [ ] Re-run `benches/indexed_vs_plain_reopen.rs` and confirm
+      `IndexedStore::open` is actually faster than `Store::open` at scale
+      before claiming the original goal is met.
+- [ ] Multi-version reads (`Snapshot`/`get_at`/`scan_at`) are still not
+      implemented on `IndexedStore` at all — deferred, not yet even
+      designed.

@@ -18,16 +18,26 @@ multi-segment log with crash recovery that survives corruption injected at
 *every* byte offset of a real file (`crates/storage/tests/crash_recovery.rs`);
 PUT/GET/DELETE/SCAN/SNAPSHOT primitives with genuine multi-version reads,
 exposed through the `vaultc` CLI; a 4096-byte slotted page format plus a
-buffer pool (clock eviction, pinning, dirty tracking); and now a real
+buffer pool (clock eviction, pinning, dirty tracking); and a real
 disk-oriented B+Tree index (`crates/storage/src/btree.rs`) with node
 splitting and multi-level growth, verified at 20,000 inserts (3+ tree
-levels) and differentially tested against `std::collections::BTreeMap`
-under both large randomized and property-based test sequences. See
-[docs/design/STORAGE.md](docs/design/STORAGE.md) for the architecture and
-[tickets/](tickets/) for what's still open — B+Tree deletion/rebalancing,
-leaf sibling links for bounded range scans, wiring the B+Tree in as
-`Store`'s real index, compaction, transactions/concurrency, and group
-commit (tickets 006–011) — before this phase closes.
+levels) and differentially tested against `std::collections::BTreeMap`.
+
+**Ticket 011 produced a negative result worth reading, not a completion.**
+Wiring the B+Tree in as `Store`'s index (`IndexedStore`) was built,
+crash-tested, and differentially proven correct — but the benchmark it
+required showed reopening is ~12x *slower* than plain `Store`, not faster,
+because persisting pages through a generic `Store` means the index pays
+its own full-log-replay against a log inflated 200x+ by page-rebuild write
+amplification. Root cause and decision recorded in
+[ADR-004](docs/design/decisions/ADR-004-indexed-store-regression-and-write-amplification.md);
+the actual fix is ticket 012.
+
+See [docs/design/STORAGE.md](docs/design/STORAGE.md) for the architecture
+and [tickets/](tickets/) for what's still open — the ticket 012 fix,
+B+Tree deletion/rebalancing, leaf sibling links for bounded range scans,
+compaction, transactions/concurrency, and group commit (tickets 006–012)
+— before this phase closes.
 
 ## The constraint
 
