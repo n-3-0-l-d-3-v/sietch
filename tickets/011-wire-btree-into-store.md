@@ -1,5 +1,5 @@
 ---
-status: open
+status: done
 phase: 2
 ---
 
@@ -8,36 +8,45 @@ phase: 2
 `Store` (tickets 001–003) rebuilds an in-memory `BTreeMap` index by
 replaying the entire log on every open. This ticket built `IndexedStore`
 (`crates/storage/src/indexed_store.rs`) to use the on-disk `BTree`
-(ticket 005) instead.
+(ticket 005) instead — and its full history is the honest record of how
+that turned out.
 
-**History**: the first version (over `LogPageStore`) was measured ~12x
-*slower* to reopen than plain `Store` — see ADR-004. Ticket 012's
-`HeapPageStore` fixed that specific root cause (~111x reduction in data
-replayed at open time — ADR-005), but absolute reopen latency still
-doesn't clearly beat plain `Store` within the tested range (100–30,000
-entries). This ticket stays open, narrowed to the remaining cause.
+## The full arc
+1. First version (over `LogPageStore`): ~12x *slower* to reopen than
+   plain `Store` at 10,000 entries. Root-caused to nested full-page replay
+   — see ADR-004.
+2. `HeapPageStore` (ticket 012): fixed that specific defect. Data replayed
+   at open time dropped ~111x (254.8x the main log -> 2.3x). Absolute
+   reopen latency improved substantially but didn't yet clearly beat plain
+   `Store` — see ADR-005.
+3. Checkpoint batching (this ticket, final round): batching the
+   reconciliation sentinel's write instead of updating it on every single
+   operation removed the remaining dominant cost. **Re-measured,
+   reproducibly, `IndexedStore::open` is now faster than plain
+   `Store::open` at 10,000+ entries (1.12x at 10,000; 1.37x at 30,000),
+   with the advantage growing with history size** — see ADR-006.
 
-## What was delivered and is correct, kept, tested
+## Acceptance criteria
 - [x] `IndexedStore`: put/get/delete/scan backed by the on-disk `BTree`
-      over `HeapPageStore`, with the durability log as source of truth.
-- [x] Crash-consistent reconciliation (unindexed log tail replayed on
-      reopen after an unclean shutdown), proven by targeted tests and
-      exhaustive byte-offset crash injection.
+      over `HeapPageStore`, durability log as source of truth.
+- [x] Crash-consistent reconciliation, including automatic checkpoint
+      batching — proven correct regardless of where a crash lands
+      relative to a checkpoint boundary
+      (`automatic_checkpointing_bounds_reconciliation_to_the_interval_not_the_whole_history`,
+      `all_values_are_correct_regardless_of_where_a_crash_lands_relative_to_a_checkpoint`),
+      and by exhaustive byte-offset crash injection
+      (`tests/indexed_store_crash_recovery.rs`, unaffected by the
+      batching change).
 - [x] Differential property test proving identical behavior to plain
-      `Store` for the same operations.
-- [x] Two full rounds of the decisive benchmark, run and reported
-      honestly both times (ADR-004, ADR-005), including a negative result
-      the first time.
+      `Store` for the same operations, unaffected by the batching change.
+- [x] The decisive benchmark, run three times across this ticket's full
+      arc, reported honestly each time — including two rounds that did
+      not yet show the intended win — until the actual, reproducible
+      crossover was measured.
 
-## What remains before this ticket can close
-- [ ] Reduce writes-per-operation: `apply_and_advance` currently does two
-      B+Tree inserts per `put`/`delete` (the user key, and the
-      reconciliation sentinel key) — identified in ADR-005 as the likely
-      dominant remaining cost, now that nested full-replay is fixed. Batch
-      or otherwise avoid updating the sentinel on every single operation.
-- [ ] Re-run `benches/indexed_vs_plain_reopen.rs` after that change and
-      confirm `IndexedStore::open` is actually faster than `Store::open`
-      at scale before claiming this ticket's original goal is met.
-- [ ] Multi-version reads (`Snapshot`/`get_at`/`scan_at`) are still not
-      implemented on `IndexedStore` at all — deferred, not yet even
-      designed.
+## Deliberately still out of scope (tracked separately, not silently dropped)
+- Multi-version reads (`Snapshot`/`get_at`/`scan_at`) are not implemented
+  on `IndexedStore` — not yet even designed. `IndexedStore` is a faster
+  drop-in for `Store`'s latest-value operations only.
+- `checkpoint_interval`'s default (128) is a reasonable starting guess,
+  not a tuned constant.

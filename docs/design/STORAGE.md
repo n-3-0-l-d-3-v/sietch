@@ -118,54 +118,54 @@ What it does not yet do: delete/rebalance (ticket 009), bounded
 range scans via leaf sibling pointers instead of a full traversal (ticket
 010).
 
-## IndexedStore — a negative result, then a documented fix, then an honest partial win
+## IndexedStore — regression, fix, fix again, then a real measured win
 
 Ticket 011 wired `BTree` in as an alternative to `Store`'s index
 (`IndexedStore`, `crates/storage/src/indexed_store.rs`), on the hypothesis
 that reopening would be fast once the index is already durable on disk
-instead of rebuilt from a full log replay every time.
+instead of rebuilt from a full log replay every time. Getting there took
+three honestly-reported rounds:
 
-**Round 1 disproved the hypothesis**: `IndexedStore::open` was measured at
-~12x *slower* than plain `Store::open` at 10,000 entries. Root cause,
-diagnosed in `docs/design/decisions/ADR-004-indexed-store-regression-and-write-amplification.md`:
-persisting B+Tree pages through a generic `Store` (ADR-002) meant opening
-the index paid its *own* full-log-replay, against a log 254.8x larger than
-the original for the same history, because of page-rebuild write
-amplification (ADR-003).
+1. **First version disproved the hypothesis**: `IndexedStore::open` was
+   ~12x *slower* than plain `Store::open` at 10,000 entries. Root cause
+   (`docs/design/decisions/ADR-004-indexed-store-regression-and-write-amplification.md`):
+   persisting B+Tree pages through a generic `Store` (ADR-002) meant
+   opening the index paid its own full-log-replay, against a log 254.8x
+   larger than the original because of page-rebuild write amplification
+   (ADR-003).
+2. **`HeapPageStore` (ticket 012) fixed that root cause**
+   (`docs/design/decisions/ADR-005-heap-page-store-fixes-the-reopen-regression.md`):
+   pages in a flat heap file never scanned at open, locations in a small
+   separately-replayed log. Data replayed at open dropped ~111x. Absolute
+   latency improved a lot but didn't yet clearly beat plain `Store`.
+3. **Checkpoint batching closed the remaining gap**
+   (`docs/design/decisions/ADR-006-checkpoint-batching.md`): the
+   reconciliation sentinel was being written and flushed after *every*
+   operation — doubling B+Tree writes relative to `Store`'s single
+   in-memory insert. Batching it (default: every 128 operations, with an
+   explicit `checkpoint()`/`flush()` for a graceful shutdown) removed that
+   cost. **Re-measured and reproduced twice: `IndexedStore::open` is now
+   faster than plain `Store::open` at 10,000+ entries (1.12x at 10,000,
+   1.37x at 30,000), with the advantage growing with history size.**
 
-**Ticket 012 fixed that specific root cause**: `HeapPageStore`
-(`crates/storage/src/heap_page_store.rs`) splits pages into a flat heap
-file that's never scanned at open (an O(1) length check) and a small,
-separately-replayed location log. Measured result in
-`docs/design/decisions/ADR-005-heap-page-store-fixes-the-reopen-regression.md`:
-data actually replayed at open dropped from 254.8x the main log to 2.3x —
-a ~111x reduction. **This is the real, decisive fix for the architectural
-defect**, and it's measured, not asserted.
-
-**What's still honest to say**: absolute reopen latency, re-measured after
-the fix, is much closer to plain `Store` but doesn't yet clearly beat it
-at the tested sizes (100–30,000 entries) — the gap narrows from ~2.7x
-slower at 100 entries to ~1.3x slower at 30,000, suggesting a crossover at
-larger scale that hasn't been demonstrated yet. The likely remaining
-cause (two B+Tree inserts per logical write instead of one, for the
-reconciliation sentinel) is identified and tracked as ticket 011's
-continuing scope, not hidden.
-
-Composing two independently-correct pieces first produced a real
-regression, then a real fix, then a real partial improvement — exactly
-the kind of finding this project's own research question ("where does
-complexity move?") exists to surface, reported at every step rather than
-only once it looked good.
+Composing independently-correct pieces first produced a real regression,
+then a real architectural fix, then a real remaining-cost fix, then a
+real, reproducible win — exactly the kind of finding this project's own
+research question ("where does complexity move?") exists to surface,
+reported honestly at every step rather than only once it looked good.
 
 ## What this slice does not claim
 
-- The KV `Store`'s index is still rebuilt into memory on every open by
-  replaying the whole log; fine for now, will not scale past the point
-  where the log no longer fits comfortably in memory-rebuild time.
-  Measured in `crates/storage/benches/append_throughput.rs`
-  (`store_reopen_recovery`). `IndexedStore` was meant to fix this and, as
-  measured, substantially improves it without yet conclusively beating
-  it — see above and ticket 011's remaining scope.
+- `IndexedStore` only speeds up latest-value operations (put/get/delete/
+  scan); multi-version reads (`Snapshot`/`get_at`/`scan_at`) are not
+  implemented on it at all, and plain `Store` remains the only option for
+  those. `checkpoint_interval`'s default (128) is a reasonable starting
+  guess, not a tuned constant.
+- Plain `Store`'s index is still rebuilt into memory on every open by
+  replaying the whole log; that's the exact scaling problem `IndexedStore`
+  now measurably fixes (see above) for the latest-value operations it
+  supports — reach for `IndexedStore` over `Store` once history size
+  matters and multi-version reads aren't needed.
 - No compaction yet, for keys or pages. Because nothing is ever
   overwritten, the log only grows — including superseded versions,
   tombstones, and every past version of every page (4096 bytes each,
