@@ -28,3 +28,7 @@ harness = false
 [[bench]]
 name = "indexed_vs_plain_reopen"
 harness = false
+
+[[bench]]
+name = "compaction"
+harness = false
