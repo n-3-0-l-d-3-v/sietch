@@ -54,11 +54,20 @@ insert/delete sequences. It deliberately skips full minimum-occupancy
 rebalancing (a fill-factor cost, not a correctness one) — see
 [ADR-008](docs/design/decisions/ADR-008-btree-deletion-without-rebalancing.md).
 
+**Ticket 010 (bounded range scans) is also closed.** Leaf pages now carry
+a right-sibling pointer, and `scan_range(start, end)` walks it instead of
+re-descending from the root. `benches/btree.rs` shows the payoff
+directly: `scan_range` costs a flat ~20–24µs regardless of tree size
+(1,000 to 50,000 entries) while the old full-traversal `scan_all` grows
+from ~85µs to ~5.4ms over the same trees — real O(log n + k) vs. O(n)
+numbers, not an assumption. The B+Tree-vs-LSM-tree comparison ticket 005
+deferred is written too, grounded in this project's own measurements —
+see [ADR-009](docs/design/decisions/ADR-009-btree-vs-lsm-tree.md).
+
 See [docs/design/STORAGE.md](docs/design/STORAGE.md) for the architecture
-and [tickets/](tickets/) for what's still open — leaf sibling links for
-bounded range scans, transactions/concurrency, group commit, and
-snapshot-aware compaction (tickets 007, 008, 010, 013) — before this
-phase closes.
+and [tickets/](tickets/) for what's still open — transactions/concurrency,
+group commit, and snapshot-aware compaction (tickets 007, 008, 013) —
+before this phase closes.
 
 ## The constraint
 

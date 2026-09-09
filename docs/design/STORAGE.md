@@ -126,8 +126,16 @@ under-full but not empty) — see
 `docs/design/decisions/ADR-008-btree-deletion-without-rebalancing.md` for
 why that's a fill-factor cost, not a correctness one.
 
-What it does not yet do: bounded range scans via leaf sibling pointers
-instead of a full traversal (ticket 010).
+Bounded range scans (ticket 010) are done too: leaf pages carry a
+right-sibling pointer (reserved slot 0, threaded correctly through
+splits), and `scan_range(start, end)` descends once to the starting leaf
+and walks the chain instead of re-descending from the root. Measured, not
+assumed: `benches/btree.rs` shows `scan_range` costing a flat ~20–24µs
+regardless of tree size (1,000 to 50,000 entries) while `scan_all` over
+the same trees grows from ~85µs to ~5.4ms — O(log n + k) vs. O(n), with
+real numbers. The B+Tree-vs-LSM-tree comparison ticket 005 deferred is
+now written, grounded in this project's own measurements:
+`docs/design/decisions/ADR-009-btree-vs-lsm-tree.md`.
 
 ## IndexedStore — regression, fix, fix again, then a real measured win
 
