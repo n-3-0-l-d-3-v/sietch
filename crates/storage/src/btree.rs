@@ -14,6 +14,14 @@ use crate::page::{Page, PageError, PageType};
 use crate::page_store::{PageId, PageStore};
 
 const META_PAGE_ID: PageId = 0;
+/// Sentinel meaning "no right sibling" (the rightmost leaf). Safe and
+/// unambiguous because page id 0 is reserved for the meta page and can
+/// never be a real leaf.
+const NO_SIBLING: PageId = 0;
+/// Same `key_len == u16::MAX` sentinel trick `InternalEntry`'s leftmost
+/// entry uses, applied to reserve leaf slot 0 for the sibling pointer
+/// instead of a real key/value entry (ticket 010).
+const SIBLING_SLOT_SENTINEL: u16 = u16::MAX;
 
 /// A key/value pair as stored in a leaf.
 type Entry = (Vec<u8>, Vec<u8>);
@@ -50,6 +58,22 @@ fn decode_leaf_entry(bytes: &[u8]) -> Entry {
     let vlen = u16_at(bytes, 2 + klen) as usize;
     let value = bytes[4 + klen..4 + klen + vlen].to_vec();
     (key, value)
+}
+
+fn encode_leaf_sibling(next: PageId) -> Vec<u8> {
+    let mut out = Vec::with_capacity(10);
+    out.extend_from_slice(&SIBLING_SLOT_SENTINEL.to_le_bytes());
+    out.extend_from_slice(&next.to_le_bytes());
+    out
+}
+
+fn decode_leaf_sibling(bytes: &[u8]) -> PageId {
+    debug_assert_eq!(
+        u16_at(bytes, 0),
+        SIBLING_SLOT_SENTINEL,
+        "slot 0 of a leaf must be its sibling pointer"
+    );
+    PageId::from_le_bytes(bytes[2..10].try_into().unwrap())
 }
 
 /// One entry in an internal node: `key = None` marks the leading,
@@ -91,10 +115,20 @@ fn decode_internal_entry(bytes: &[u8]) -> InternalEntry {
     }
 }
 
+/// Slot 0 of every leaf is reserved for the sibling pointer (ticket 010);
+/// real entries always start at slot 1.
 fn read_leaf_entries(page: &Page) -> Vec<Entry> {
     page.slot_ids()
+        .skip(1)
         .map(|s| decode_leaf_entry(page.get(s).unwrap()))
         .collect()
+}
+
+fn read_leaf_sibling(page: &Page) -> PageId {
+    decode_leaf_sibling(
+        page.get(0)
+            .expect("every leaf must have a slot 0 sibling pointer"),
+    )
 }
 
 fn read_internal_entries(page: &Page) -> Vec<InternalEntry> {
@@ -104,10 +138,12 @@ fn read_internal_entries(page: &Page) -> Vec<InternalEntry> {
 }
 
 /// Rebuilds a leaf page from scratch containing exactly `entries`, in
-/// order. Returns `Err(PageError::Full)` if they don't all fit — the
+/// order, plus its right-sibling pointer (`NO_SIBLING` for the rightmost
+/// leaf). Returns `Err(PageError::Full)` if they don't all fit — the
 /// caller is responsible for splitting in that case.
-fn build_leaf(entries: &[Entry]) -> Result<Page, PageError> {
+fn build_leaf(entries: &[Entry], next_sibling: PageId) -> Result<Page, PageError> {
     let mut page = Page::new(PageType::BTreeLeaf);
+    page.insert(&encode_leaf_sibling(next_sibling))?;
     for (k, v) in entries {
         page.insert(&encode_leaf_entry(k, v))?;
     }
@@ -148,6 +184,10 @@ impl<S: PageStore> BTree<S> {
             .is_empty();
         if !has_root {
             let root_id = pool.new_page(PageType::BTreeLeaf)?;
+            // `new_page` only allocates a bare, empty page — every real
+            // leaf must have its slot 0 sibling pointer, so build one
+            // properly rather than leaving the bare page in place.
+            *pool.page_mut(root_id).unwrap() = build_leaf(&[], NO_SIBLING)?;
             pool.unpin(root_id, true)?;
             let meta = pool.page_mut(META_PAGE_ID).unwrap();
             meta.insert(&root_id.to_le_bytes())?;
@@ -242,13 +282,14 @@ impl<S: PageStore> BTree<S> {
 
         match page_type {
             PageType::BTreeLeaf => {
+                let old_next_sibling = read_leaf_sibling(self.pool.page(page_id).unwrap());
                 let mut entries = read_leaf_entries(self.pool.page(page_id).unwrap());
                 match entries.binary_search_by(|(k, _)| k.as_slice().cmp(key)) {
                     Ok(i) => entries[i].1 = value.to_vec(),
                     Err(i) => entries.insert(i, (key.to_vec(), value.to_vec())),
                 }
 
-                let split = match build_leaf(&entries) {
+                let split = match build_leaf(&entries, old_next_sibling) {
                     Ok(page) => {
                         *self.pool.page_mut(page_id).unwrap() = page;
                         None
@@ -256,9 +297,13 @@ impl<S: PageStore> BTree<S> {
                     Err(PageError::Full { .. }) => {
                         let mid = split_at_midpoint(&entries);
                         let (left, right) = entries.split_at(mid);
-                        *self.pool.page_mut(page_id).unwrap() = build_leaf(left)?;
                         let right_id = self.pool.new_page(PageType::BTreeLeaf)?;
-                        *self.pool.page_mut(right_id).unwrap() = build_leaf(right)?;
+                        // Left now points to the new right sibling; right
+                        // inherits whatever this leaf pointed to before —
+                        // threading the split into the existing chain.
+                        *self.pool.page_mut(page_id).unwrap() = build_leaf(left, right_id)?;
+                        *self.pool.page_mut(right_id).unwrap() =
+                            build_leaf(right, old_next_sibling)?;
                         let sep = right[0].0.clone();
                         self.pool.unpin(right_id, true)?;
                         Some((sep, right_id))
@@ -381,6 +426,7 @@ impl<S: PageStore> BTree<S> {
 
         match page_type {
             PageType::BTreeLeaf => {
+                let next_sibling = read_leaf_sibling(self.pool.page(page_id).unwrap());
                 let mut entries = read_leaf_entries(self.pool.page(page_id).unwrap());
                 let found = match entries.binary_search_by(|(k, _)| k.as_slice().cmp(key)) {
                     Ok(i) => {
@@ -390,7 +436,10 @@ impl<S: PageStore> BTree<S> {
                     Err(_) => false,
                 };
                 if found {
-                    *self.pool.page_mut(page_id).unwrap() = build_leaf(&entries)?;
+                    // The sibling pointer never changes on delete — only
+                    // a split (during insert) ever threads a new leaf
+                    // into the chain.
+                    *self.pool.page_mut(page_id).unwrap() = build_leaf(&entries, next_sibling)?;
                 }
                 self.pool.unpin(page_id, found)?;
                 Ok((found, entries.is_empty()))
@@ -474,6 +523,73 @@ impl<S: PageStore> BTree<S> {
             other => unreachable!("unexpected page type in btree: {other:?}"),
         }
         Ok(())
+    }
+
+    /// Bounded range scan (ticket 010): `[start, end)`, half-open like
+    /// `Vec::drain` and friends. Descends once to the leaf that would
+    /// contain `start`, then walks right-sibling pointers instead of
+    /// re-descending from the root for every leaf — O(log n + k) instead
+    /// of `scan_all`'s O(n) full traversal, for a scan bounded to k
+    /// results.
+    pub fn scan_range(
+        &mut self,
+        start: &[u8],
+        end: &[u8],
+    ) -> Result<Vec<Entry>, BTreeError<S::Error>> {
+        let root = self.root_id()?;
+        let mut leaf_id = self.find_leaf_for_key(root, start)?;
+        let mut out = Vec::new();
+
+        loop {
+            self.pool.fetch(leaf_id)?;
+            let page = self.pool.page(leaf_id).unwrap();
+            let entries = read_leaf_entries(page);
+            let next_sibling = read_leaf_sibling(page);
+            self.pool.unpin(leaf_id, false)?;
+
+            let mut reached_end = false;
+            for (k, v) in entries {
+                if k.as_slice() >= end {
+                    reached_end = true;
+                    break;
+                }
+                if k.as_slice() >= start {
+                    out.push((k, v));
+                }
+            }
+
+            if reached_end || next_sibling == NO_SIBLING {
+                break;
+            }
+            leaf_id = next_sibling;
+        }
+
+        Ok(out)
+    }
+
+    /// Descends from `page_id` following the same routing `get`/`insert`
+    /// use, until reaching the leaf that would contain `key` (whether or
+    /// not it actually does).
+    fn find_leaf_for_key(
+        &mut self,
+        page_id: PageId,
+        key: &[u8],
+    ) -> Result<PageId, BTreeError<S::Error>> {
+        self.pool.fetch(page_id)?;
+        let page = self.pool.page(page_id).unwrap();
+        match page.page_type {
+            PageType::BTreeLeaf => {
+                self.pool.unpin(page_id, false)?;
+                Ok(page_id)
+            }
+            PageType::BTreeInternal => {
+                let entries = read_internal_entries(page);
+                let child = route(&entries, key);
+                self.pool.unpin(page_id, false)?;
+                self.find_leaf_for_key(child, key)
+            }
+            other => unreachable!("unexpected page type in btree: {other:?}"),
+        }
     }
 
     pub fn flush(&mut self) -> Result<(), BTreeError<S::Error>> {
@@ -751,6 +867,90 @@ mod tests {
         let scanned = t.scan_all().unwrap();
         let expected: Vec<(Vec<u8>, Vec<u8>)> = model.into_iter().collect();
         assert_eq!(scanned, expected);
+    }
+
+    #[test]
+    fn scan_range_returns_half_open_bounded_results_in_order() {
+        let mut t = tree(128);
+        for i in 0..50u32 {
+            t.insert(format!("{i:03}").into_bytes(), format!("v{i}").into_bytes())
+                .unwrap();
+        }
+        let results = t.scan_range(b"010", b"015").unwrap();
+        let keys: Vec<String> = results
+            .into_iter()
+            .map(|(k, _)| String::from_utf8(k).unwrap())
+            .collect();
+        assert_eq!(
+            keys,
+            vec!["010", "011", "012", "013", "014"],
+            "end bound must be exclusive, start inclusive"
+        );
+    }
+
+    #[test]
+    fn scan_range_spans_multiple_leaves_via_sibling_pointers() {
+        let mut t = tree(64);
+        // Small keys/values plus a small pool force many leaf splits, so
+        // the range below must span several distinct leaf pages.
+        let n = 3000u32;
+        for i in 0..n {
+            t.insert(format!("{i:06}").into_bytes(), vec![b'v'; 20])
+                .unwrap();
+        }
+        assert!(
+            t.depth().unwrap() >= 2,
+            "expected the tree to have actually split into multiple leaves"
+        );
+
+        let results = t.scan_range(b"001000", b"002000").unwrap();
+        assert_eq!(results.len(), 1000);
+        for (i, (k, _)) in results.iter().enumerate() {
+            assert_eq!(k, format!("{:06}", 1000 + i as u32).as_bytes());
+        }
+    }
+
+    #[test]
+    fn scan_range_matches_scan_all_filtered_to_the_same_bounds() {
+        let mut t = tree(96);
+        let mut keys: Vec<u32> = (0..600).collect();
+        keys.reverse();
+        for k in &keys {
+            t.insert(format!("{k:05}").into_bytes(), b"v".to_vec())
+                .unwrap();
+        }
+
+        let start = b"00100".to_vec();
+        let end = b"00400".to_vec();
+        let ranged = t.scan_range(&start, &end).unwrap();
+        let all = t.scan_all().unwrap();
+        let expected: Vec<Entry> = all
+            .into_iter()
+            .filter(|(k, _)| k.as_slice() >= start.as_slice() && k.as_slice() < end.as_slice())
+            .collect();
+        assert_eq!(ranged, expected);
+    }
+
+    #[test]
+    fn scan_range_after_deletes_reflects_current_state() {
+        let mut t = tree(64);
+        for i in 0..200u32 {
+            t.insert(format!("{i:04}").into_bytes(), format!("v{i}").into_bytes())
+                .unwrap();
+        }
+        for i in (50..100).step_by(2) {
+            t.delete(format!("{i:04}").as_bytes()).unwrap();
+        }
+        let results = t.scan_range(b"0050", b"0100").unwrap();
+        let expected: Vec<String> = (50..100)
+            .filter(|i| i % 2 != 0)
+            .map(|i| format!("{i:04}"))
+            .collect();
+        let actual: Vec<String> = results
+            .into_iter()
+            .map(|(k, _)| String::from_utf8(k).unwrap())
+            .collect();
+        assert_eq!(actual, expected);
     }
 
     /// A tiny deterministic shuffle (no external RNG dependency needed for
