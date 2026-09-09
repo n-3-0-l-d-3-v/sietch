@@ -80,4 +80,30 @@ proptest! {
         let expected: Vec<(Vec<u8>, Vec<u8>)> = model.into_iter().collect();
         prop_assert_eq!(scanned, expected);
     }
+
+    /// `scan_range` (ticket 010, sibling-pointer-based) must agree with
+    /// `scan_all` filtered to the same half-open bounds, for arbitrary
+    /// insert sequences and arbitrary bounds — proving the sibling-chain
+    /// traversal doesn't diverge from the already-proven full traversal.
+    #[test]
+    fn scan_range_matches_scan_all_filtered_to_the_same_bounds(
+        ops in prop::collection::vec((arb_key(), arb_value()), 1..200),
+        start in 0u8..20,
+        len in 0u8..20,
+    ) {
+        let mut tree = BTree::open(MemPageStore::new(), 8).unwrap();
+        for (k, v) in &ops {
+            tree.insert(k.clone(), v.clone()).unwrap();
+        }
+
+        let end = start.saturating_add(len);
+        let start_key = vec![start];
+        let end_key = vec![end];
+
+        let ranged = tree.scan_range(&start_key, &end_key).unwrap();
+        let all = tree.scan_all().unwrap();
+        let expected: Vec<(Vec<u8>, Vec<u8>)> =
+            all.into_iter().filter(|(k, _)| k.as_slice() >= start_key.as_slice() && k.as_slice() < end_key.as_slice()).collect();
+        prop_assert_eq!(ranged, expected);
+    }
 }
