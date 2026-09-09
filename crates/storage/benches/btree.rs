@@ -69,10 +69,38 @@ fn bench_insert_durable(c: &mut Criterion) {
     });
 }
 
+/// The ticket 010 claim, measured: `scan_range` for a small, fixed-size
+/// window should cost roughly the same regardless of total tree size
+/// (O(log n) to find the start leaf, O(k) to walk it), while `scan_all`
+/// over the same growing tree should cost more as the tree grows (O(n)).
+fn bench_range_scan_vs_full_scan_as_tree_grows(c: &mut Criterion) {
+    let mut group = c.benchmark_group("btree_range_scan_vs_full_scan");
+    for count in [1_000usize, 10_000, 50_000] {
+        let mut tree = BTree::open(MemPageStore::new(), 256).unwrap();
+        for i in 0..count {
+            tree.insert(format!("{i:08}").into_bytes(), format!("v{i}").into_bytes())
+                .unwrap();
+        }
+
+        group.bench_with_input(
+            BenchmarkId::new("scan_range_100_results", count),
+            &(),
+            |b, ()| {
+                b.iter(|| black_box(tree.scan_range(b"00000100", b"00000200").unwrap()));
+            },
+        );
+        group.bench_with_input(BenchmarkId::new("scan_all", count), &(), |b, ()| {
+            b.iter(|| black_box(tree.scan_all().unwrap()));
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_insert_in_memory,
     bench_point_get_in_memory,
-    bench_insert_durable
+    bench_insert_durable,
+    bench_range_scan_vs_full_scan_as_tree_grows
 );
 criterion_main!(benches);
