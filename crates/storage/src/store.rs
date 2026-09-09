@@ -2,16 +2,39 @@
 //! per `docs/design/CONSTRAINTS.md` ("start with these before any
 //! relational layer exists"). Built entirely on `Log` — every version of
 //! every key is an immutable record; nothing is ever mutated in place.
+//!
+//! Compaction (ticket 006) is the one operation here that touches more
+//! than "append a record": see `compact()` and
+//! `docs/design/decisions/ADR-007-compaction-commit-marker.md` for how it
+//! stays crash-safe without ever mutating a segment in place.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
 
 use crate::log::{Log, LogError};
+
+const COMPACT_TMP_DIR: &str = ".compact-tmp";
+const COMPACT_READY_MARKER: &str = ".compaction-ready";
+const COMPACT_OLD_BACKUP_DIR: &str = ".compact-old-backup";
+const COMPACT_PLACEHOLDER_DIR: &str = ".compact-placeholder";
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
     #[error(transparent)]
     Log(#[from] LogError),
+    #[error("io error: {0}")]
+    Io(#[from] io::Error),
+}
+
+/// What a completed compaction did, so callers can observe it rather than
+/// trust it blindly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompactionReport {
+    pub live_keys: usize,
+    pub segments_before: usize,
+    pub segments_after: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -30,6 +53,7 @@ pub struct Snapshot {
 }
 
 pub struct Store {
+    dir: PathBuf,
     log: Log,
     index: BTreeMap<Vec<u8>, Vec<VersionEntry>>,
     /// True if the most recent `open` had to discard a torn tail — exposed
@@ -40,7 +64,10 @@ pub struct Store {
 
 impl Store {
     pub fn open(dir: impl Into<PathBuf>) -> Result<Self, StoreError> {
-        let (log, report) = Log::open(dir)?;
+        let dir = dir.into();
+        finish_or_discard_pending_compaction(&dir)?;
+
+        let (log, report) = Log::open(&dir)?;
         let mut index: BTreeMap<Vec<u8>, Vec<VersionEntry>> = BTreeMap::new();
         for record in report.records {
             let value = match record.record_type {
@@ -53,9 +80,85 @@ impl Store {
             });
         }
         Ok(Self {
+            dir,
             log,
             index,
             recovered_from_torn_tail: report.recovered_from_torn_tail,
+        })
+    }
+
+    /// Rewrites the log to contain exactly one live record per current
+    /// key (its latest value; tombstoned keys are dropped entirely),
+    /// reclaiming space from superseded versions and deletions. Never
+    /// mutates an existing segment: the replacement log is built
+    /// completely in a temporary directory, committed via a marker file,
+    /// and only then swapped in — see
+    /// `docs/design/decisions/ADR-007-compaction-commit-marker.md` for why
+    /// this is crash-safe at every point.
+    ///
+    /// **Known limitation**: this discards *all* non-latest versions,
+    /// including ones an outstanding `Snapshot` might still reference.
+    /// Compacting while an older snapshot is in use will make
+    /// `get_at`/`scan_at` calls against it return incomplete results.
+    /// Snapshot-aware compaction (keeping versions a live snapshot still
+    /// needs) is tracked as a follow-up, not silently assumed safe.
+    pub fn compact(&mut self) -> Result<CompactionReport, StoreError> {
+        let segments_before = self.log.segment_count();
+        let live_entries: Vec<(Vec<u8>, Vec<u8>)> = self
+            .index
+            .iter()
+            .filter_map(|(k, versions)| {
+                versions
+                    .last()
+                    .and_then(|v| v.value.clone())
+                    .map(|val| (k.clone(), val))
+            })
+            .collect();
+
+        let tmp_dir = self.dir.join(COMPACT_TMP_DIR);
+        if tmp_dir.exists() {
+            fs::remove_dir_all(&tmp_dir)?;
+        }
+        fs::create_dir_all(&tmp_dir)?;
+        {
+            let (mut tmp_log, _) = Log::open(&tmp_dir)?;
+            for (k, v) in &live_entries {
+                tmp_log.append_put(k.clone(), v.clone())?;
+            }
+            // `tmp_log` drops here: every record it holds was already
+            // fsync'd on append, and dropping releases its file handles,
+            // which the swap below needs (Windows will not let us delete
+            // or rename files that are still open).
+        }
+
+        // Commit point: once this marker exists, recovery must finish
+        // the swap using `tmp_dir` rather than trusting the old segments,
+        // even if we crash before a single old file is touched.
+        fs::write(self.dir.join(COMPACT_READY_MARKER), b"")?;
+
+        // Release this Store's own handles on the old segment files
+        // before the swap touches them (required on Windows) by
+        // swapping in a throwaway placeholder Log over a scratch
+        // directory for the duration of the swap.
+        let placeholder_dir = self.dir.join(COMPACT_PLACEHOLDER_DIR);
+        if placeholder_dir.exists() {
+            fs::remove_dir_all(&placeholder_dir)?;
+        }
+        fs::create_dir_all(&placeholder_dir)?;
+        let (placeholder_log, _) = Log::open(&placeholder_dir)?;
+        drop(std::mem::replace(&mut self.log, placeholder_log));
+
+        finish_pending_compaction(&self.dir)?;
+
+        let (log, _report) = Log::open(&self.dir)?;
+        let segments_after = log.segment_count();
+        self.log = log; // drops the placeholder Log, releasing its handles
+        fs::remove_dir_all(&placeholder_dir)?;
+
+        Ok(CompactionReport {
+            live_keys: live_entries.len(),
+            segments_before,
+            segments_after,
         })
     }
 
@@ -142,6 +245,95 @@ impl Store {
     }
 }
 
+fn remove_if_exists(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+fn remove_dir_if_exists(path: &Path) -> io::Result<()> {
+    match fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Called from `Store::open`: if a previous `compact()` crashed after its
+/// commit marker was written but before the swap finished, finish the
+/// swap now. If the marker is absent, no compaction was ever committed —
+/// discard any leftover scratch directories and let the untouched
+/// original segments stand.
+fn finish_or_discard_pending_compaction(dir: &Path) -> Result<(), StoreError> {
+    let marker = dir.join(COMPACT_READY_MARKER);
+    if marker.exists() {
+        finish_pending_compaction(dir)?;
+    } else {
+        remove_dir_if_exists(&dir.join(COMPACT_TMP_DIR))?;
+    }
+    remove_dir_if_exists(&dir.join(COMPACT_PLACEHOLDER_DIR))?;
+    Ok(())
+}
+
+/// Performs the actual swap in three steps, each individually resumable
+/// from a crash at any point, because after step 1 there is never a
+/// moment where "old" and "new" segment files share the same directory
+/// under the same names (which would make a resumed cleanup unable to
+/// tell them apart — see
+/// `docs/design/decisions/ADR-007-compaction-commit-marker.md`):
+///
+/// 1. Move every current `seg-*.log` file directly under `dir` into a
+///    backup directory (no-op if that backup already exists — meaning
+///    step 1 already completed on a prior, interrupted attempt).
+/// 2. Move every file out of the compacted-log temp directory into
+///    `dir` (naturally idempotent: already-moved files are simply no
+///    longer present in the temp directory to move again).
+/// 3. Once both scratch directories are empty, remove them and the
+///    commit marker — only now is the old data actually deleted.
+///
+/// If neither the temp directory nor the backup directory exist, there is
+/// nothing left to migrate (a real `compact()` call always removes both
+/// together with the marker at the very end) — step 1 must *not* run in
+/// that case, or it would mistake the already-correct current segments
+/// for "old" ones and destroy them on cleanup. This only clears a stray
+/// marker.
+fn finish_pending_compaction(dir: &Path) -> Result<(), StoreError> {
+    let tmp_dir = dir.join(COMPACT_TMP_DIR);
+    let backup_dir = dir.join(COMPACT_OLD_BACKUP_DIR);
+
+    if !tmp_dir.exists() && !backup_dir.exists() {
+        remove_if_exists(&dir.join(COMPACT_READY_MARKER))?;
+        return Ok(());
+    }
+
+    if !backup_dir.exists() {
+        fs::create_dir_all(&backup_dir)?;
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with("seg-") && name_str.ends_with(".log") {
+                fs::rename(entry.path(), backup_dir.join(&name))?;
+            }
+        }
+    }
+
+    if tmp_dir.exists() {
+        for entry in fs::read_dir(&tmp_dir)? {
+            let entry = entry?;
+            let dest = dir.join(entry.file_name());
+            fs::rename(entry.path(), dest)?;
+        }
+    }
+
+    remove_dir_if_exists(&tmp_dir)?;
+    remove_dir_if_exists(&backup_dir)?;
+    remove_if_exists(&dir.join(COMPACT_READY_MARKER))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,5 +395,257 @@ mod tests {
         assert_eq!(store.get(b"a"), None);
         assert_eq!(store.get(b"b"), Some(b"2".to_vec()));
         assert!(!store.recovered_from_torn_tail);
+    }
+
+    #[test]
+    fn compact_preserves_live_values_and_drops_tombstoned_keys() {
+        let dir = tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        store.put("a", "1").unwrap();
+        store.put("a", "2").unwrap(); // superseded version, should be dropped
+        store.put("b", "keep").unwrap();
+        store.put("c", "gone").unwrap();
+        store.delete("c").unwrap(); // tombstoned, should be dropped entirely
+
+        let report = store.compact().unwrap();
+        assert_eq!(report.live_keys, 2); // "a" and "b"
+
+        assert_eq!(store.get(b"a"), Some(b"2".to_vec()));
+        assert_eq!(store.get(b"b"), Some(b"keep".to_vec()));
+        assert_eq!(store.get(b"c"), None);
+    }
+
+    #[test]
+    fn compacted_state_survives_reopen() {
+        let dir = tempdir().unwrap();
+        {
+            let mut store = Store::open(dir.path()).unwrap();
+            for i in 0..20u32 {
+                store.put(format!("k{i}"), format!("v{i}")).unwrap();
+            }
+            for i in 0..10u32 {
+                store.delete(format!("k{i}")).unwrap();
+            }
+            store.compact().unwrap();
+        }
+        let store = Store::open(dir.path()).unwrap();
+        for i in 0..10u32 {
+            assert_eq!(
+                store.get(format!("k{i}").as_bytes()),
+                None,
+                "k{i} should have stayed deleted after compaction"
+            );
+        }
+        for i in 10..20u32 {
+            assert_eq!(
+                store.get(format!("k{i}").as_bytes()),
+                Some(format!("v{i}").into_bytes())
+            );
+        }
+    }
+
+    #[test]
+    fn compaction_actually_reduces_stored_history() {
+        let dir = tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        // Many overwrites of the same small key set: lots of superseded
+        // history that compaction should be able to discard.
+        for round in 0..200u32 {
+            store.put("k", format!("v{round}")).unwrap();
+        }
+        let before: u64 = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().metadata().unwrap().len())
+            .sum();
+        store.compact().unwrap();
+        let after: u64 = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().metadata().unwrap().len())
+            .sum();
+        assert!(
+            after < before,
+            "compaction should shrink on-disk size (before={before}, after={after})"
+        );
+        assert_eq!(store.get(b"k"), Some(b"v199".to_vec()));
+    }
+
+    #[test]
+    fn you_can_keep_writing_after_compaction() {
+        let dir = tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        store.put("a", "1").unwrap();
+        store.compact().unwrap();
+        store.put("b", "2").unwrap();
+        assert_eq!(store.get(b"a"), Some(b"1".to_vec()));
+        assert_eq!(store.get(b"b"), Some(b"2".to_vec()));
+
+        drop(store);
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(store.get(b"a"), Some(b"1".to_vec()));
+        assert_eq!(store.get(b"b"), Some(b"2".to_vec()));
+    }
+
+    #[test]
+    fn a_crash_before_the_commit_marker_leaves_the_original_state_intact() {
+        let dir = tempdir().unwrap();
+        {
+            let mut store = Store::open(dir.path()).unwrap();
+            store.put("a", "1").unwrap();
+            store.put("b", "2").unwrap();
+        }
+        // Simulate a crash mid-compaction: the tmp log got written, but
+        // the commit marker never did.
+        let tmp_dir = dir.path().join(COMPACT_TMP_DIR);
+        fs::create_dir_all(&tmp_dir).unwrap();
+        {
+            let (mut tmp_log, _) = Log::open(&tmp_dir).unwrap();
+            tmp_log
+                .append_put(b"a".to_vec(), b"WRONG".to_vec())
+                .unwrap();
+        }
+        assert!(!dir.path().join(COMPACT_READY_MARKER).exists());
+
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(
+            store.get(b"a"),
+            Some(b"1".to_vec()),
+            "uncommitted compaction attempt must not affect recovered state"
+        );
+        assert_eq!(store.get(b"b"), Some(b"2".to_vec()));
+        assert!(
+            !tmp_dir.exists(),
+            "leftover uncommitted tmp dir should be cleaned up on open"
+        );
+    }
+
+    #[test]
+    fn a_crash_after_the_commit_marker_finishes_the_swap_on_reopen() {
+        let dir = tempdir().unwrap();
+        {
+            let mut store = Store::open(dir.path()).unwrap();
+            store.put("a", "1").unwrap();
+            store.put("b", "2").unwrap();
+        }
+        // Simulate a crash right after the commit marker was written:
+        // build a valid compacted tmp log and write the marker, but never
+        // run the actual swap.
+        let tmp_dir = dir.path().join(COMPACT_TMP_DIR);
+        fs::create_dir_all(&tmp_dir).unwrap();
+        {
+            let (mut tmp_log, _) = Log::open(&tmp_dir).unwrap();
+            tmp_log
+                .append_put(b"a".to_vec(), b"COMPACTED".to_vec())
+                .unwrap();
+        }
+        fs::write(dir.path().join(COMPACT_READY_MARKER), b"").unwrap();
+
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(
+            store.get(b"a"),
+            Some(b"COMPACTED".to_vec()),
+            "a committed-but-unswapped compaction must be finished on next open"
+        );
+        assert_eq!(
+            store.get(b"b"),
+            None,
+            "the compacted log is authoritative once committed, even if it dropped a key"
+        );
+        assert!(!dir.path().join(COMPACT_READY_MARKER).exists());
+        assert!(!tmp_dir.exists());
+        assert!(!dir.path().join(COMPACT_OLD_BACKUP_DIR).exists());
+    }
+
+    #[test]
+    fn a_crash_mid_swap_after_backup_but_before_move_still_finishes_correctly() {
+        let dir = tempdir().unwrap();
+        {
+            let mut store = Store::open(dir.path()).unwrap();
+            store.put("a", "1").unwrap();
+        }
+        let tmp_dir = dir.path().join(COMPACT_TMP_DIR);
+        fs::create_dir_all(&tmp_dir).unwrap();
+        {
+            let (mut tmp_log, _) = Log::open(&tmp_dir).unwrap();
+            tmp_log
+                .append_put(b"a".to_vec(), b"COMPACTED".to_vec())
+                .unwrap();
+        }
+        fs::write(dir.path().join(COMPACT_READY_MARKER), b"").unwrap();
+
+        // Simulate the swap having completed step 1 (old segments backed
+        // up) but crashing before step 2 (moving the new ones in).
+        let backup_dir = dir.path().join(COMPACT_OLD_BACKUP_DIR);
+        fs::create_dir_all(&backup_dir).unwrap();
+        for entry in fs::read_dir(dir.path()).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with("seg-") && name_str.ends_with(".log") {
+                fs::rename(entry.path(), backup_dir.join(&name)).unwrap();
+            }
+        }
+
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(store.get(b"a"), Some(b"COMPACTED".to_vec()));
+        assert!(!backup_dir.exists());
+        assert!(!tmp_dir.exists());
+    }
+
+    #[test]
+    fn a_crash_after_move_but_before_backup_cleanup_still_finishes_correctly() {
+        let dir = tempdir().unwrap();
+        {
+            let mut store = Store::open(dir.path()).unwrap();
+            store.put("a", "1").unwrap();
+        }
+        fs::write(dir.path().join(COMPACT_READY_MARKER), b"").unwrap();
+
+        // Simulate: old segments already backed up, new ones already
+        // moved into place — only the final cleanup (removing the
+        // now-obsolete backup) never ran.
+        let backup_dir = dir.path().join(COMPACT_OLD_BACKUP_DIR);
+        fs::create_dir_all(&backup_dir).unwrap();
+        for entry in fs::read_dir(dir.path()).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with("seg-") && name_str.ends_with(".log") {
+                fs::rename(entry.path(), backup_dir.join(&name)).unwrap();
+            }
+        }
+        {
+            let (mut new_log, _) = Log::open(dir.path()).unwrap();
+            new_log
+                .append_put(b"a".to_vec(), b"COMPACTED".to_vec())
+                .unwrap();
+        }
+
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(store.get(b"a"), Some(b"COMPACTED".to_vec()));
+        assert!(
+            !backup_dir.exists(),
+            "obsolete backup must be cleaned up on the finishing open"
+        );
+        assert!(!dir.path().join(COMPACT_READY_MARKER).exists());
+    }
+
+    #[test]
+    fn a_crash_after_full_cleanup_except_the_marker_is_still_idempotent() {
+        let dir = tempdir().unwrap();
+        {
+            let mut store = Store::open(dir.path()).unwrap();
+            store.put("a", "1").unwrap();
+            store.compact().unwrap();
+        }
+        // Simulate: the real compact() already finished everything except
+        // that the process died before removing its own marker (an
+        // artificial state — compact() itself removes tmp/backup/marker
+        // together at the end — but recovery must tolerate a stray
+        // marker with nothing left to actually finish).
+        fs::write(dir.path().join(COMPACT_READY_MARKER), b"").unwrap();
+
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(store.get(b"a"), Some(b"1".to_vec()));
+        assert!(!dir.path().join(COMPACT_READY_MARKER).exists());
     }
 }
