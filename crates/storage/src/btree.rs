@@ -327,6 +327,116 @@ impl<S: PageStore> BTree<S> {
         }
     }
 
+    /// Removes `key` if present, returning whether it was found. Keeps the
+    /// tree well-formed (no node is ever left with zero live entries) by
+    /// propagating "this child became empty" up to its parent, which
+    /// either promotes a sibling to fill the gap or, if it was the
+    /// parent's only remaining entry, becomes empty itself and propagates
+    /// further — all the way up to shrinking the root when it collapses
+    /// to a single child. See ticket 009 for what this deliberately does
+    /// *not* do: proper minimum-occupancy rebalancing (redistributing
+    /// from a sibling, or merging two under-full-but-nonempty nodes). A
+    /// node with just one or two entries is left exactly that sparse; the
+    /// only guarantee is that a node is never left completely empty,
+    /// which would otherwise be a structurally invalid tree, not just an
+    /// inefficient one.
+    pub fn delete(&mut self, key: &[u8]) -> Result<bool, BTreeError<S::Error>> {
+        let root = self.root_id()?;
+        let (found, root_emptied) = self.delete_recursive(root, key)?;
+
+        if root_emptied {
+            self.pool.fetch(root)?;
+            let page_type = self.pool.page(root).unwrap().page_type;
+            if page_type == PageType::BTreeInternal {
+                // The root collapsed to a single child: that child
+                // becomes the new root, shrinking the tree's height. The
+                // old root page is left unreferenced (page-level
+                // reclamation doesn't exist yet — see ADR-003/ADR-005's
+                // documented compaction gaps).
+                let entries = read_internal_entries(self.pool.page(root).unwrap());
+                let new_root = entries[0].child;
+                self.pool.unpin(root, false)?;
+                self.set_root_id(new_root)?;
+            } else {
+                // The root is an empty leaf (the whole tree is empty) —
+                // that's a perfectly valid state, nothing to shrink.
+                self.pool.unpin(root, false)?;
+            }
+        }
+
+        Ok(found)
+    }
+
+    /// Returns `(found, this_node_is_now_empty)`. A leaf becomes empty
+    /// when its last entry is removed; an internal node becomes empty
+    /// only when collapsing its emptied child leaves it with nothing but
+    /// a single remaining child pointer and no separator keys at all.
+    fn delete_recursive(
+        &mut self,
+        page_id: PageId,
+        key: &[u8],
+    ) -> Result<(bool, bool), BTreeError<S::Error>> {
+        self.pool.fetch(page_id)?;
+        let page_type = self.pool.page(page_id).unwrap().page_type;
+
+        match page_type {
+            PageType::BTreeLeaf => {
+                let mut entries = read_leaf_entries(self.pool.page(page_id).unwrap());
+                let found = match entries.binary_search_by(|(k, _)| k.as_slice().cmp(key)) {
+                    Ok(i) => {
+                        entries.remove(i);
+                        true
+                    }
+                    Err(_) => false,
+                };
+                if found {
+                    *self.pool.page_mut(page_id).unwrap() = build_leaf(&entries)?;
+                }
+                self.pool.unpin(page_id, found)?;
+                Ok((found, entries.is_empty()))
+            }
+            PageType::BTreeInternal => {
+                let entries = read_internal_entries(self.pool.page(page_id).unwrap());
+                let child_index = route_index(&entries, key);
+                let child = entries[child_index].child;
+                self.pool.unpin(page_id, false)?;
+
+                let (found, child_emptied) = self.delete_recursive(child, key)?;
+                if !found {
+                    return Ok((false, false));
+                }
+                if !child_emptied {
+                    return Ok((true, false));
+                }
+
+                self.pool.fetch(page_id)?;
+                let mut entries = read_internal_entries(self.pool.page(page_id).unwrap());
+                if child_index == 0 {
+                    if entries.len() == 1 {
+                        // The only entry (the leftmost pointer itself)
+                        // emptied out and there is nothing to promote in
+                        // its place: this node has nothing left either.
+                        self.pool.unpin(page_id, false)?;
+                        return Ok((true, true));
+                    }
+                    // Promote the next entry to become the new leftmost.
+                    entries[0] = InternalEntry {
+                        key: None,
+                        child: entries[1].child,
+                    };
+                    entries.remove(1);
+                } else {
+                    entries.remove(child_index);
+                }
+
+                *self.pool.page_mut(page_id).unwrap() = build_internal(&entries)?;
+                self.pool.unpin(page_id, true)?;
+                Ok((true, entries.is_empty()))
+            }
+            other => unreachable!("unexpected page type in btree: {other:?}"),
+        }
+    }
+
     /// Full in-order traversal. Correct for any tree shape, but O(n) in
     /// the number of live entries rather than O(log n + k) for a bounded
     /// range — see the "known limitations" note in
@@ -401,10 +511,18 @@ impl<S: PageStore> BTree<S> {
 /// key routes to: the last entry whose key is `<= search_key`, or the
 /// leading (`key = None`) leftmost child if none qualify.
 fn route(entries: &[InternalEntry], search_key: &[u8]) -> PageId {
-    let mut chosen = entries[0].child;
-    for entry in &entries[1..] {
+    entries[route_index(entries, search_key)].child
+}
+
+/// Same as `route`, but returns the index into `entries` rather than the
+/// child id — needed by `delete_recursive`, which must know exactly which
+/// entry to adjust or remove once it learns the child it recursed into
+/// became empty.
+fn route_index(entries: &[InternalEntry], search_key: &[u8]) -> usize {
+    let mut chosen = 0;
+    for (i, entry) in entries.iter().enumerate().skip(1) {
         match &entry.key {
-            Some(k) if k.as_slice() <= search_key => chosen = entry.child,
+            Some(k) if k.as_slice() <= search_key => chosen = i,
             _ => break,
         }
     }
@@ -510,6 +628,123 @@ mod tests {
             t.insert(key.clone(), value.clone()).unwrap();
             model.insert(key, value);
         }
+        for (k, v) in &model {
+            assert_eq!(t.get(k).unwrap().as_ref(), Some(v));
+        }
+        let scanned = t.scan_all().unwrap();
+        let expected: Vec<(Vec<u8>, Vec<u8>)> = model.into_iter().collect();
+        assert_eq!(scanned, expected);
+    }
+
+    #[test]
+    fn delete_removes_a_key_and_returns_true() {
+        let mut t = tree(64);
+        t.insert(b"a".to_vec(), b"1".to_vec()).unwrap();
+        t.insert(b"b".to_vec(), b"2".to_vec()).unwrap();
+        assert!(t.delete(b"a").unwrap());
+        assert_eq!(t.get(b"a").unwrap(), None);
+        assert_eq!(t.get(b"b").unwrap(), Some(b"2".to_vec()));
+    }
+
+    #[test]
+    fn delete_of_a_missing_key_returns_false_and_changes_nothing() {
+        let mut t = tree(64);
+        t.insert(b"a".to_vec(), b"1".to_vec()).unwrap();
+        assert!(!t.delete(b"missing").unwrap());
+        assert_eq!(t.get(b"a").unwrap(), Some(b"1".to_vec()));
+    }
+
+    #[test]
+    fn deleting_every_key_leaves_an_empty_but_valid_tree() {
+        let mut t = tree(64);
+        for i in 0..10u32 {
+            t.insert(format!("k{i}").into_bytes(), format!("v{i}").into_bytes())
+                .unwrap();
+        }
+        for i in 0..10u32 {
+            assert!(t.delete(format!("k{i}").as_bytes()).unwrap());
+        }
+        assert_eq!(t.scan_all().unwrap(), Vec::<Entry>::new());
+        // The tree must still work correctly afterward.
+        t.insert(b"fresh".to_vec(), b"start".to_vec()).unwrap();
+        assert_eq!(t.get(b"fresh").unwrap(), Some(b"start".to_vec()));
+    }
+
+    #[test]
+    fn root_shrinks_after_deletes_collapse_it_to_a_single_child() {
+        let mut t = tree(64);
+        // Force splits so the root becomes internal.
+        for i in 0..2000u32 {
+            t.insert(format!("k{i:06}").into_bytes(), vec![b'v'; 40])
+                .unwrap();
+        }
+        assert!(t.depth().unwrap() >= 2, "root should have split by now");
+
+        // Delete almost everything back down.
+        for i in 0..1990u32 {
+            assert!(t.delete(format!("k{i:06}").as_bytes()).unwrap());
+        }
+        // Remaining keys must still all be there and correct.
+        for i in 1990..2000u32 {
+            assert_eq!(
+                t.get(format!("k{i:06}").as_bytes()).unwrap(),
+                Some(vec![b'v'; 40])
+            );
+        }
+    }
+
+    #[test]
+    fn delete_then_reinsert_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let store = crate::page_store::LogPageStore::open(dir.path()).unwrap();
+            let mut t = BTree::open(store, 64).unwrap();
+            for i in 0..50u32 {
+                t.insert(format!("k{i}").into_bytes(), format!("v{i}").into_bytes())
+                    .unwrap();
+            }
+            for i in 0..25u32 {
+                t.delete(format!("k{i}").as_bytes()).unwrap();
+            }
+            t.insert(b"new-key".to_vec(), b"new-value".to_vec())
+                .unwrap();
+            t.flush().unwrap();
+        }
+        let store = crate::page_store::LogPageStore::open(dir.path()).unwrap();
+        let mut t = BTree::open(store, 64).unwrap();
+        for i in 0..25u32 {
+            assert_eq!(t.get(format!("k{i}").as_bytes()).unwrap(), None);
+        }
+        for i in 25..50u32 {
+            assert_eq!(
+                t.get(format!("k{i}").as_bytes()).unwrap(),
+                Some(format!("v{i}").into_bytes())
+            );
+        }
+        assert_eq!(t.get(b"new-key").unwrap(), Some(b"new-value".to_vec()));
+    }
+
+    #[test]
+    fn interleaved_insert_and_delete_matches_a_reference_btreemap() {
+        use rand_like::shuffled_range;
+        let mut t = tree(64);
+        let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+
+        let keys: Vec<u32> = shuffled_range(0, 400);
+        for (i, k) in keys.iter().enumerate() {
+            let key = format!("{k:06}").into_bytes();
+            let value = format!("v{k}").into_bytes();
+            t.insert(key.clone(), value.clone()).unwrap();
+            model.insert(key, value);
+
+            // Every third insert, also delete an already-inserted key.
+            if i % 3 == 0 && i > 0 {
+                let delete_target = format!("{:06}", keys[i / 2]).into_bytes();
+                let expected_found = model.remove(&delete_target).is_some();
+                assert_eq!(t.delete(&delete_target).unwrap(), expected_found);
+            }
+        }
+
         for (k, v) in &model {
             assert_eq!(t.get(k).unwrap().as_ref(), Some(v));
         }
