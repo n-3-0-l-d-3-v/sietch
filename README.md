@@ -37,11 +37,20 @@ and checkpoint batching then removed the remaining per-operation overhead
 plain `Store::open` at 10,000+ entries (1.12x at 10,000, 1.37x at 30,000),
 with the advantage growing with history size.**
 
+**Ticket 006 (compaction) is also closed.** `Store::compact()` rewrites
+the log to hold only live data, never mutating an existing segment —
+built around a commit-marker protocol whose crash-safety is proven by six
+tests covering every distinguishable interruption point, one of which
+caught a real bug (an early design could have destroyed the only valid
+copy of the data during a specific crash-timing edge case) before it
+shipped. See
+[ADR-007](docs/design/decisions/ADR-007-compaction-commit-marker.md).
+
 See [docs/design/STORAGE.md](docs/design/STORAGE.md) for the architecture
 and [tickets/](tickets/) for what's still open — B+Tree deletion/
-rebalancing, leaf sibling links for bounded range scans, compaction,
-transactions/concurrency, and group commit (tickets 006–010) — before
-this phase closes.
+rebalancing, leaf sibling links for bounded range scans,
+transactions/concurrency, group commit, and snapshot-aware compaction
+(tickets 007–010, 013) — before this phase closes.
 
 ## The constraint
 

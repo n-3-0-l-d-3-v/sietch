@@ -154,6 +154,29 @@ real, reproducible win — exactly the kind of finding this project's own
 research question ("where does complexity move?") exists to surface,
 reported honestly at every step rather than only once it looked good.
 
+## Compaction
+
+`Store::compact()` rewrites the log to hold exactly one live record per
+current key (latest value only; tombstoned keys dropped entirely),
+reclaiming space from superseded versions and deletions — the direct
+answer to "because nothing can be overwritten, storage grows forever
+without a compaction policy." It never mutates an existing segment: the
+replacement log is built completely in a temp directory, committed via a
+marker file, and only then swapped in through a three-step,
+always-resumable-from-any-crash-point protocol — see
+`docs/design/decisions/ADR-007-compaction-commit-marker.md`, which also
+documents a real bug (an early design could have destroyed the only valid
+copy of the data during a specific crash-timing edge case) that a test
+caught before it shipped.
+
+**Known limitation**: compaction discards *all* non-latest versions
+unconditionally, including ones an outstanding `Snapshot` might still be
+reading — using `get_at`/`scan_at` against a snapshot taken before a
+compaction will silently return incomplete results. Snapshot-aware
+compaction is ticket 013, not yet started. Compaction currently applies to
+plain `Store` only, not `IndexedStore` or the B+Tree's pages — page-level
+reclamation is separate future work.
+
 ## What this slice does not claim
 
 - `IndexedStore` only speeds up latest-value operations (put/get/delete/
@@ -166,12 +189,10 @@ reported honestly at every step rather than only once it looked good.
   now measurably fixes (see above) for the latest-value operations it
   supports — reach for `IndexedStore` over `Store` once history size
   matters and multi-version reads aren't needed.
-- No compaction yet, for keys or pages. Because nothing is ever
-  overwritten, the log only grows — including superseded versions,
-  tombstones, and every past version of every page (4096 bytes each,
-  strictly worse than a plain key's growth). Ticket 006.
-- No in-page compaction either: a deleted slot's bytes are never reclaimed
-  within a page.
+- No page-level compaction yet: every past version of every B+Tree page
+  (4096 bytes each) still accumulates forever in `HeapPageStore`'s heap
+  file, and a deleted slot's bytes are never reclaimed within a page
+  either.
 - Single-writer only; no locking or multi-process coordination.
 - `fsync` per record (and therefore per dirty page flush) makes every
   write durable but limits throughput — measured at ~1ms/put for keys
