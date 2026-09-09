@@ -81,3 +81,45 @@ fn tree_survives_reopening_mid_growth_and_keeps_inserting_correctly() {
         );
     }
 }
+
+#[test]
+fn deletes_committed_before_a_crash_stay_deleted_after_reopening() {
+    let dir = tempdir().unwrap();
+    {
+        let store = LogPageStore::open(dir.path()).unwrap();
+        let mut tree = BTree::open(store, 32).unwrap();
+        for i in 0..200u32 {
+            tree.insert(
+                format!("key{i:04}").into_bytes(),
+                format!("value{i}").into_bytes(),
+            )
+            .unwrap();
+        }
+        for i in 0..100u32 {
+            tree.delete(format!("key{i:04}").as_bytes()).unwrap();
+        }
+        tree.flush().unwrap();
+    }
+
+    let seg_path = dir.path().join("seg-0000000000000000.log");
+    if seg_path.exists() {
+        let mut f = OpenOptions::new().append(true).open(&seg_path).unwrap();
+        f.write_all(&[0u8; 30]).unwrap();
+    }
+
+    let store = LogPageStore::open(dir.path()).unwrap();
+    let mut tree = BTree::open(store, 32).unwrap();
+    for i in 0..100u32 {
+        assert_eq!(
+            tree.get(format!("key{i:04}").as_bytes()).unwrap(),
+            None,
+            "key{i:04} should have stayed deleted after a crash"
+        );
+    }
+    for i in 100..200u32 {
+        assert_eq!(
+            tree.get(format!("key{i:04}").as_bytes()).unwrap(),
+            Some(format!("value{i}").into_bytes())
+        );
+    }
+}

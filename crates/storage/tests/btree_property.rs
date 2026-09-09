@@ -42,4 +42,42 @@ proptest! {
         let expected: Vec<(Vec<u8>, Vec<u8>)> = model.into_iter().collect();
         prop_assert_eq!(scanned, expected);
     }
+
+    /// Same idea, but for arbitrary interleavings of insert and delete
+    /// (ticket 009) — the tree's `delete` return value, `get`, and
+    /// `scan_all` must all agree with a plain `BTreeMap` used the same
+    /// way, for any sequence.
+    #[test]
+    fn tree_matches_reference_btreemap_for_interleaved_insert_and_delete(
+        ops in prop::collection::vec((arb_key(), arb_value(), any::<bool>()), 1..300)
+    ) {
+        let mut tree = BTree::open(MemPageStore::new(), 8).unwrap();
+        let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+
+        for (k, v, is_delete) in &ops {
+            if *is_delete {
+                let expected_found = model.remove(k).is_some();
+                let actual_found = tree.delete(k).unwrap();
+                prop_assert_eq!(actual_found, expected_found, "delete return value mismatch for key {:?}", k);
+            } else {
+                tree.insert(k.clone(), v.clone()).unwrap();
+                model.insert(k.clone(), v.clone());
+            }
+        }
+
+        for (k, expected) in &model {
+            let actual = tree.get(k).unwrap();
+            prop_assert_eq!(actual.as_ref(), Some(expected));
+        }
+        // Every key not in the model must genuinely be gone from the tree.
+        for k in (0u8..20).map(|b| vec![b]) {
+            if !model.contains_key(&k) {
+                prop_assert_eq!(tree.get(&k).unwrap(), None);
+            }
+        }
+
+        let scanned = tree.scan_all().unwrap();
+        let expected: Vec<(Vec<u8>, Vec<u8>)> = model.into_iter().collect();
+        prop_assert_eq!(scanned, expected);
+    }
 }
