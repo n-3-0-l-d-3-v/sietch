@@ -46,11 +46,19 @@ copy of the data during a specific crash-timing edge case) before it
 shipped. See
 [ADR-007](docs/design/decisions/ADR-007-compaction-commit-marker.md).
 
+**Ticket 009 (B+Tree deletion) is also closed.** `BTree::delete` keeps the
+tree well-formed by propagating "this node became completely empty" up
+through the tree — proven at scale (2,000 inserts collapsed back to 10
+keys) and against a reference `BTreeMap` for arbitrary interleaved
+insert/delete sequences. It deliberately skips full minimum-occupancy
+rebalancing (a fill-factor cost, not a correctness one) — see
+[ADR-008](docs/design/decisions/ADR-008-btree-deletion-without-rebalancing.md).
+
 See [docs/design/STORAGE.md](docs/design/STORAGE.md) for the architecture
-and [tickets/](tickets/) for what's still open — B+Tree deletion/
-rebalancing, leaf sibling links for bounded range scans,
-transactions/concurrency, group commit, and snapshot-aware compaction
-(tickets 007–010, 013) — before this phase closes.
+and [tickets/](tickets/) for what's still open — leaf sibling links for
+bounded range scans, transactions/concurrency, group commit, and
+snapshot-aware compaction (tickets 007, 008, 010, 013) — before this
+phase closes.
 
 ## The constraint
 

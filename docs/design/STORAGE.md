@@ -114,9 +114,20 @@ matches a reference `std::collections::BTreeMap` under both a large
 randomized differential test and a proptest property test over arbitrary
 insert sequences with upserts.
 
-What it does not yet do: delete/rebalance (ticket 009), bounded
-range scans via leaf sibling pointers instead of a full traversal (ticket
-010).
+`delete` (ticket 009) is done too: it propagates "this node became
+completely empty" up through the tree — promoting a sibling into a
+vacated leftmost slot, or dropping a reference outright, all the way up
+to shrinking the root when it collapses to a single child. Proven at
+scale (2,000 inserts collapsed back to 10 keys, tree still fully correct)
+and against a reference `BTreeMap` for arbitrary interleaved insert/delete
+sequences. It deliberately does *not* do full minimum-occupancy
+rebalancing (redistributing from or merging with a sibling when a node is
+under-full but not empty) — see
+`docs/design/decisions/ADR-008-btree-deletion-without-rebalancing.md` for
+why that's a fill-factor cost, not a correctness one.
+
+What it does not yet do: bounded range scans via leaf sibling pointers
+instead of a full traversal (ticket 010).
 
 ## IndexedStore — regression, fix, fix again, then a real measured win
 
