@@ -57,6 +57,14 @@ pub struct Snapshot {
     as_of_seq: u64,
 }
 
+impl Snapshot {
+    /// Exposed for `txn::Transaction`'s conflict check — the sequence
+    /// number this snapshot was taken at.
+    pub(crate) fn as_of_seq(&self) -> u64 {
+        self.as_of_seq
+    }
+}
+
 pub struct Store {
     dir: PathBuf,
     log: Log,
@@ -276,6 +284,18 @@ impl Store {
         Snapshot {
             as_of_seq: self.log.next_seq(),
         }
+    }
+
+    /// The sequence number of `key`'s most recently committed version, if
+    /// it has one — the write-write conflict check `txn::Transaction`
+    /// needs at commit time (has anyone committed a newer version of this
+    /// key since my snapshot was taken?), exposed here rather than
+    /// duplicating `Store`'s index layout in `txn.rs`.
+    pub(crate) fn latest_seq(&self, key: &[u8]) -> Option<u64> {
+        self.index
+            .get(key)
+            .and_then(|versions| versions.last())
+            .map(|v| v.seq)
     }
 }
 
