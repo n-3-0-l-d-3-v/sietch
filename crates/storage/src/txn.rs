@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 use crate::log::LogOp;
-use crate::store::{Snapshot, Store, StoreError, WriteOp};
+use crate::store::{Snapshot, SnapshotGuard, Store, StoreError, WriteOp};
 
 #[derive(Debug, thiserror::Error)]
 pub enum TxnError {
@@ -45,12 +45,17 @@ impl TransactionalStore {
     /// Starts a new transaction reading from a snapshot taken right now.
     /// The transaction sees exactly the state as of this call, and nothing
     /// committed by any other transaction afterward — that's what Snapshot
-    /// Isolation means here.
+    /// Isolation means here. The snapshot is held (ticket 013's
+    /// `SnapshotGuard`) for the transaction's whole lifetime, so a
+    /// concurrent `Store::compact()` can never invalidate an in-flight
+    /// transaction's reads.
     pub fn begin(&self) -> Transaction {
-        let snapshot = self.inner.lock().unwrap().snapshot();
+        let guard = self.inner.lock().unwrap().hold_snapshot();
+        let snapshot = guard.snapshot();
         Transaction {
             store: self.inner.clone(),
             snapshot,
+            _snapshot_guard: guard,
             writes: BTreeMap::new(),
         }
     }
@@ -60,6 +65,14 @@ impl TransactionalStore {
     pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
         self.inner.lock().unwrap().get(key)
     }
+
+    /// Runs `Store::compact()` against the underlying store. Any
+    /// transaction currently open on this `TransactionalStore` is holding
+    /// its own snapshot (see `begin()`), so compaction never invalidates
+    /// an in-flight transaction's reads.
+    pub fn compact(&self) -> Result<crate::store::CompactionReport, StoreError> {
+        self.inner.lock().unwrap().compact()
+    }
 }
 
 /// A buffered set of reads/writes against a snapshot of the store. Nothing
@@ -68,6 +81,10 @@ impl TransactionalStore {
 pub struct Transaction {
     store: Arc<Mutex<Store>>,
     snapshot: Snapshot,
+    /// Keeps `Store::compact()` from discarding versions this
+    /// transaction's snapshot might still need — held for as long as the
+    /// transaction lives, released automatically on commit or abort.
+    _snapshot_guard: SnapshotGuard,
     /// `None` is a buffered delete; `Some` a buffered put. Buffered
     /// writes are applied in key order at commit time via a single
     /// `apply_batch` call (ticket 008), so a multi-key transaction is one
@@ -251,6 +268,36 @@ mod tests {
 
         assert_eq!(ts.get(b"a"), Some(b"1".to_vec()));
         assert_eq!(ts.get(b"b"), Some(b"2".to_vec()));
+    }
+
+    #[test]
+    fn compacting_while_a_transaction_is_open_does_not_break_its_reads() {
+        let dir = tempdir().unwrap();
+        let ts = TransactionalStore::open(dir.path()).unwrap();
+        {
+            let mut txn = ts.begin();
+            txn.put("a", "1");
+            txn.commit().unwrap();
+        }
+
+        // This transaction's snapshot must survive the compaction below.
+        let reader = ts.begin();
+        assert_eq!(reader.get(b"a"), Some(b"1".to_vec()));
+
+        {
+            let mut writer = ts.begin();
+            writer.put("a", "2");
+            writer.commit().unwrap();
+        }
+
+        ts.compact().unwrap();
+
+        assert_eq!(
+            reader.get(b"a"),
+            Some(b"1".to_vec()),
+            "compaction while a transaction is open must not change what it reads"
+        );
+        assert_eq!(ts.get(b"a"), Some(b"2".to_vec()));
     }
 
     #[test]
