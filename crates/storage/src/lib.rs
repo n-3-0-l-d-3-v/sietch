@@ -15,6 +15,7 @@ pub mod page_store;
 pub mod record;
 pub mod segment;
 pub mod store;
+pub mod txn;
 
 pub use btree::{BTree, BTreeError};
 pub use buffer::{BufferError, BufferPool};
@@ -25,3 +26,4 @@ pub use page::{Page, PageError, PageType, SlotId, PAGE_SIZE};
 pub use page_store::{LogPageStore, LogPageStoreError, MemPageStore, PageId, PageStore};
 pub use record::{Record, RecordType};
 pub use store::{Snapshot, Store, StoreError, WriteOp};
+pub use txn::{Transaction, TransactionalStore, TxnError};
