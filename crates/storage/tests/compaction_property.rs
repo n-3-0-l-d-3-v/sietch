@@ -46,4 +46,51 @@ proptest! {
             prop_assert_eq!(&actual, expected, "compaction changed get() for {}", key);
         }
     }
+
+    /// Ticket 013: compacting while a snapshot is held must not change
+    /// what that snapshot's `get_at` returns, for arbitrary put/delete
+    /// sequences interleaved with the point the snapshot was taken.
+    #[test]
+    fn compacting_with_a_held_snapshot_never_changes_that_snapshots_reads(
+        before in prop::collection::vec((0..6u8, 0..6u8, any::<bool>()), 1..30),
+        after in prop::collection::vec((0..6u8, 0..6u8, any::<bool>()), 0..30),
+    ) {
+        let dir = tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        let mut model_at_snapshot: HashMap<String, Option<String>> = HashMap::new();
+
+        for (k, v, is_delete) in &before {
+            let key = format!("k{k}");
+            if *is_delete {
+                store.delete(key.clone()).unwrap();
+                model_at_snapshot.insert(key, None);
+            } else {
+                let value = format!("v{v}");
+                store.put(key.clone(), value.clone()).unwrap();
+                model_at_snapshot.insert(key, Some(value));
+            }
+        }
+
+        let guard = store.hold_snapshot();
+        let snapshot = guard.snapshot();
+        let expected = model_at_snapshot.clone();
+
+        for (k, v, is_delete) in &after {
+            let key = format!("k{k}");
+            if *is_delete {
+                store.delete(key).unwrap();
+            } else {
+                store.put(key, format!("v{v}")).unwrap();
+            }
+        }
+
+        store.compact().unwrap();
+
+        for (key, expected_value) in &expected {
+            let actual = store
+                .get_at(key.as_bytes(), snapshot)
+                .map(|v| String::from_utf8(v).unwrap());
+            prop_assert_eq!(&actual, expected_value, "held snapshot's get_at changed for {} after compaction", key);
+        }
+    }
 }
