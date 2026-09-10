@@ -25,5 +25,5 @@ pub use log::{Log, LogError, LogOp, OpenReport};
 pub use page::{Page, PageError, PageType, SlotId, PAGE_SIZE};
 pub use page_store::{LogPageStore, LogPageStoreError, MemPageStore, PageId, PageStore};
 pub use record::{Record, RecordType};
-pub use store::{Snapshot, Store, StoreError, WriteOp};
+pub use store::{Snapshot, SnapshotGuard, Store, StoreError, WriteOp};
 pub use txn::{Transaction, TransactionalStore, TxnError};

@@ -12,9 +12,10 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use crate::log::{Log, LogError, LogOp};
-use crate::record::RecordType;
+use crate::record::{Record, RecordType};
 
 /// One write to include in a batch — see `Store::apply_batch` (ticket 008
 /// — group commit).
@@ -65,6 +66,33 @@ impl Snapshot {
     }
 }
 
+/// A held reference to a `Snapshot` that keeps `compact()` from discarding
+/// versions it still needs (ticket 013). Dropping the guard releases the
+/// hold; a `Store` with no held guards compacts exactly as before (only
+/// each key's current value survives).
+pub struct SnapshotGuard {
+    snapshot: Snapshot,
+    registry: Arc<Mutex<BTreeMap<u64, usize>>>,
+}
+
+impl SnapshotGuard {
+    pub fn snapshot(&self) -> Snapshot {
+        self.snapshot
+    }
+}
+
+impl Drop for SnapshotGuard {
+    fn drop(&mut self) {
+        let mut registry = self.registry.lock().unwrap();
+        if let Some(count) = registry.get_mut(&self.snapshot.as_of_seq) {
+            *count -= 1;
+            if *count == 0 {
+                registry.remove(&self.snapshot.as_of_seq);
+            }
+        }
+    }
+}
+
 pub struct Store {
     dir: PathBuf,
     log: Log,
@@ -73,6 +101,9 @@ pub struct Store {
     /// so callers/tests can assert recovery behavior rather than just
     /// trusting it silently happened.
     pub recovered_from_torn_tail: bool,
+    /// `as_of_seq -> number of live SnapshotGuards holding it`. `compact()`
+    /// consults this to find the oldest snapshot it must not invalidate.
+    held_snapshots: Arc<Mutex<BTreeMap<u64, usize>>>,
 }
 
 impl Store {
@@ -97,36 +128,82 @@ impl Store {
             log,
             index,
             recovered_from_torn_tail: report.recovered_from_torn_tail,
+            held_snapshots: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
 
-    /// Rewrites the log to contain exactly one live record per current
-    /// key (its latest value; tombstoned keys are dropped entirely),
-    /// reclaiming space from superseded versions and deletions. Never
-    /// mutates an existing segment: the replacement log is built
-    /// completely in a temporary directory, committed via a marker file,
-    /// and only then swapped in — see
-    /// `docs/design/decisions/ADR-007-compaction-commit-marker.md` for why
-    /// this is crash-safe at every point.
+    /// Takes a snapshot and holds it open against future compactions:
+    /// while this guard (or any other guard on the same or an older
+    /// snapshot) is alive, `compact()` preserves every version a held
+    /// snapshot could still need, not just each key's current value. Drop
+    /// the guard when done with it — an unreleased guard permanently caps
+    /// how much compaction can reclaim.
+    pub fn hold_snapshot(&self) -> SnapshotGuard {
+        let snapshot = self.snapshot();
+        let mut registry = self.held_snapshots.lock().unwrap();
+        *registry.entry(snapshot.as_of_seq).or_insert(0) += 1;
+        SnapshotGuard {
+            snapshot,
+            registry: self.held_snapshots.clone(),
+        }
+    }
+
+    fn oldest_held_snapshot_seq(&self) -> Option<u64> {
+        self.held_snapshots.lock().unwrap().keys().next().copied()
+    }
+
+    /// Rewrites the log to hold only the versions still reachable: each
+    /// key's current value always survives, and if any `SnapshotGuard` is
+    /// held, every version at or after the *oldest* held snapshot's
+    /// sequence number survives too, plus (for each key) the one version
+    /// that snapshot itself would read — the latest version strictly
+    /// before it. A key with nothing to retain (fully tombstoned, and
+    /// created no earlier than the oldest held snapshot so nothing could
+    /// have seen it as live) is dropped entirely, same as before.
     ///
-    /// **Known limitation**: this discards *all* non-latest versions,
-    /// including ones an outstanding `Snapshot` might still reference.
-    /// Compacting while an older snapshot is in use will make
-    /// `get_at`/`scan_at` calls against it return incomplete results.
-    /// Snapshot-aware compaction (keeping versions a live snapshot still
-    /// needs) is tracked as a follow-up, not silently assumed safe.
+    /// Surviving records keep their **original** sequence numbers (via
+    /// `Log::append_records_verbatim`) rather than being renumbered —
+    /// renumbering would silently scramble every held snapshot's
+    /// before/after ordering. Never mutates an existing segment: the
+    /// replacement log is built completely in a temporary directory,
+    /// committed via a marker file, and only then swapped in — see
+    /// `docs/design/decisions/ADR-007-compaction-commit-marker.md` for why
+    /// this is crash-safe at every point, and
+    /// `docs/design/decisions/ADR-012-snapshot-aware-compaction.md` for
+    /// this ticket's retention design.
     pub fn compact(&mut self) -> Result<CompactionReport, StoreError> {
         let segments_before = self.log.segment_count();
-        let live_entries: Vec<(Vec<u8>, Vec<u8>)> = self
-            .index
-            .iter()
-            .filter_map(|(k, versions)| {
-                versions
+        let retain_from = self.oldest_held_snapshot_seq();
+
+        let mut records: Vec<Record> = Vec::new();
+        let mut live_keys = 0usize;
+        for (key, versions) in self.index.iter() {
+            let retained: Vec<&VersionEntry> = match retain_from {
+                None => versions
                     .last()
-                    .and_then(|v| v.value.clone())
-                    .map(|val| (k.clone(), val))
-            })
-            .collect();
+                    .into_iter()
+                    .filter(|v| v.value.is_some())
+                    .collect(),
+                Some(threshold) => {
+                    let boundary = versions.iter().rev().find(|v| v.seq < threshold);
+                    let tail = versions.iter().filter(|v| v.seq >= threshold);
+                    boundary.into_iter().chain(tail).collect()
+                }
+            };
+            if retained.is_empty() {
+                continue;
+            }
+            if retained.last().unwrap().value.is_some() {
+                live_keys += 1;
+            }
+            for v in retained {
+                records.push(match &v.value {
+                    Some(val) => Record::put(v.seq, key.clone(), val.clone()),
+                    None => Record::delete(v.seq, key.clone()),
+                });
+            }
+        }
+        records.sort_by_key(|r| r.seq);
 
         let tmp_dir = self.dir.join(COMPACT_TMP_DIR);
         if tmp_dir.exists() {
@@ -135,9 +212,7 @@ impl Store {
         fs::create_dir_all(&tmp_dir)?;
         {
             let (mut tmp_log, _) = Log::open(&tmp_dir)?;
-            for (k, v) in &live_entries {
-                tmp_log.append_put(k.clone(), v.clone())?;
-            }
+            tmp_log.append_records_verbatim(&records)?;
             // `tmp_log` drops here: every record it holds was already
             // fsync'd on append, and dropping releases its file handles,
             // which the swap below needs (Windows will not let us delete
@@ -169,7 +244,7 @@ impl Store {
         fs::remove_dir_all(&placeholder_dir)?;
 
         Ok(CompactionReport {
-            live_keys: live_entries.len(),
+            live_keys,
             segments_before,
             segments_after,
         })
@@ -549,6 +624,78 @@ mod tests {
         assert_eq!(store.get(b"a"), Some(b"2".to_vec()));
         assert_eq!(store.get(b"b"), Some(b"keep".to_vec()));
         assert_eq!(store.get(b"c"), None);
+    }
+
+    #[test]
+    fn compacting_while_a_snapshot_is_held_does_not_break_its_reads() {
+        let dir = tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        store.put("a", "1").unwrap();
+        store.put("b", "keep").unwrap();
+
+        let guard = store.hold_snapshot();
+        let snapshot = guard.snapshot();
+
+        // Everything below happens strictly after the snapshot was taken.
+        store.put("a", "2").unwrap();
+        store.put("c", "new-after-snapshot").unwrap();
+        store.delete("b").unwrap();
+
+        store.compact().unwrap();
+
+        // The held snapshot must still see exactly what it saw before
+        // compaction touched anything.
+        assert_eq!(store.get_at(b"a", snapshot), Some(b"1".to_vec()));
+        assert_eq!(store.get_at(b"b", snapshot), Some(b"keep".to_vec()));
+        assert_eq!(store.get_at(b"c", snapshot), None);
+
+        // The live (unsnapshotted) view reflects everything, as normal.
+        assert_eq!(store.get(b"a"), Some(b"2".to_vec()));
+        assert_eq!(store.get(b"b"), None);
+        assert_eq!(store.get(b"c"), Some(b"new-after-snapshot".to_vec()));
+    }
+
+    #[test]
+    fn a_key_deleted_entirely_before_the_held_snapshot_stays_dropped_by_compaction() {
+        let dir = tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        store.put("a", "1").unwrap();
+        store.delete("a").unwrap();
+
+        // The snapshot is taken after "a" was already deleted — it never
+        // saw "a" as live, so compaction owes it nothing for that key.
+        let guard = store.hold_snapshot();
+        let snapshot = guard.snapshot();
+
+        store.compact().unwrap();
+
+        assert_eq!(store.get_at(b"a", snapshot), None);
+        assert_eq!(store.get(b"a"), None);
+    }
+
+    #[test]
+    fn releasing_a_snapshot_guard_lets_compaction_reclaim_its_versions_again() {
+        let dir = tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        store.put("a", "1").unwrap();
+
+        {
+            let _guard = store.hold_snapshot();
+            store.put("a", "2").unwrap();
+            // _guard drops here, releasing the hold before compact() runs.
+        }
+
+        store.put("a", "3").unwrap();
+        let report = store.compact().unwrap();
+        assert_eq!(report.live_keys, 1);
+        assert_eq!(store.get(b"a"), Some(b"3".to_vec()));
+
+        // Reopening rebuilds the index straight from the compacted log —
+        // if any now-unneeded superseded version had survived, this would
+        // still return the right answer, but the disk footprint wouldn't
+        // have shrunk (covered by `compaction_actually_reduces_stored_history`).
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(store.get(b"a"), Some(b"3".to_vec()));
     }
 
     #[test]
