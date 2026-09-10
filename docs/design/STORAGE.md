@@ -214,8 +214,16 @@ reclamation is separate future work.
   either.
 - Single-writer only; no locking or multi-process coordination.
 - `fsync` per record (and therefore per dirty page flush) makes every
-  write durable but limits throughput — measured at ~1ms/put for keys
-  (`append_throughput.rs`) and ~1ms per dirty page evicted
-  (`buffer_pool.rs`'s `buffer_pool_eviction_churn_dirty_pages_logpagestore`),
-  both dominated by fsync latency, not CPU. Group-commit / batched fsync
-  is a natural future optimization, deliberately not done yet — ticket 008.
+  individual `put`/`delete` durable but limits throughput — measured at
+  ~1ms/put for keys (`append_throughput.rs`) and ~1ms per dirty page
+  evicted (`buffer_pool.rs`'s
+  `buffer_pool_eviction_churn_dirty_pages_logpagestore`), both dominated
+  by fsync latency, not CPU. Ticket 008 (group commit) gives callers with
+  a batch of writes ready an explicit way around this —
+  `Store::apply_batch` shares one `fsync` across the whole batch, measured
+  at ~7.5x–260x faster than the same writes issued one `put` at a time
+  (growing with batch size — see
+  `docs/design/decisions/ADR-010-group-commit.md`). It does not change
+  the per-call cost of `put`/`delete` themselves, and `IndexedStore`'s
+  data writes (as opposed to its already-batched checkpoint sentinel,
+  ADR-006) don't yet have an equivalent batch API.

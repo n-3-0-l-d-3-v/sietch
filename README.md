@@ -64,10 +64,21 @@ numbers, not an assumption. The B+Tree-vs-LSM-tree comparison ticket 005
 deferred is written too, grounded in this project's own measurements —
 see [ADR-009](docs/design/decisions/ADR-009-btree-vs-lsm-tree.md).
 
+**Ticket 008 (group commit) is also closed.** `Store::apply_batch` shares
+one `fsync` across a whole caller-supplied batch of writes instead of one
+per write — an explicit, caller-controlled API rather than a background
+timer, so a batch's durability point is always exactly what the caller
+intended. `benches/append_throughput.rs`'s `store_group_commit` group
+measures the same writes both ways in the same run: ~7.5x faster at 10
+writes, ~57x at 100, ~260x at 1,000, growing with batch size because a
+batched write pays roughly one fixed `fsync` cost regardless of how many
+records share it. See
+[ADR-010](docs/design/decisions/ADR-010-group-commit.md).
+
 See [docs/design/STORAGE.md](docs/design/STORAGE.md) for the architecture
-and [tickets/](tickets/) for what's still open — transactions/concurrency,
-group commit, and snapshot-aware compaction (tickets 007, 008, 013) —
-before this phase closes.
+and [tickets/](tickets/) for what's still open — transactions/concurrency
+and snapshot-aware compaction (tickets 007, 013) — before this phase
+closes.
 
 ## The constraint
 
