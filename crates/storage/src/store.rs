@@ -13,7 +13,12 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use crate::log::{Log, LogError};
+use crate::log::{Log, LogError, LogOp};
+use crate::record::RecordType;
+
+/// One write to include in a batch — see `Store::apply_batch` (ticket 008
+/// — group commit).
+pub type WriteOp = LogOp;
 
 const COMPACT_TMP_DIR: &str = ".compact-tmp";
 const COMPACT_READY_MARKER: &str = ".compaction-ready";
@@ -186,6 +191,35 @@ impl Store {
         Ok(())
     }
 
+    /// Applies every op in `ops` with a single trailing `fsync` instead of
+    /// one per op (ticket 008 — group commit). Semantically identical to
+    /// calling `put`/`delete` once per op in order — only the durability
+    /// cost changes. See `docs/design/decisions/ADR-010-group-commit.md`
+    /// for the measured throughput/latency trade this makes, and why it's
+    /// an explicit batch API rather than a background timer: a caller
+    /// always controls exactly which writes share a durability point.
+    pub fn apply_batch(&mut self, ops: Vec<WriteOp>) -> Result<(), StoreError> {
+        let keys: Vec<Vec<u8>> = ops
+            .iter()
+            .map(|op| match op {
+                LogOp::Put(k, _) => k.clone(),
+                LogOp::Delete(k) => k.clone(),
+            })
+            .collect();
+        let records = self.log.append_batch(ops)?;
+        for (key, record) in keys.into_iter().zip(records) {
+            let value = match record.record_type {
+                RecordType::Put => Some(record.value),
+                RecordType::Delete => None,
+            };
+            self.index.entry(key).or_default().push(VersionEntry {
+                seq: record.seq,
+                value,
+            });
+        }
+        Ok(())
+    }
+
     pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
         self.index
             .get(key)
@@ -354,6 +388,88 @@ mod tests {
         store.put("a", "1").unwrap();
         store.delete("a").unwrap();
         assert_eq!(store.get(b"a"), None);
+    }
+
+    #[test]
+    fn apply_batch_has_the_same_effect_as_the_same_ops_applied_one_at_a_time() {
+        let dir_batched = tempdir().unwrap();
+        let mut batched = Store::open(dir_batched.path()).unwrap();
+        batched
+            .apply_batch(vec![
+                WriteOp::Put(b"a".to_vec(), b"1".to_vec()),
+                WriteOp::Put(b"b".to_vec(), b"2".to_vec()),
+                WriteOp::Delete(b"a".to_vec()),
+            ])
+            .unwrap();
+
+        let dir_sequential = tempdir().unwrap();
+        let mut sequential = Store::open(dir_sequential.path()).unwrap();
+        sequential.put("a", "1").unwrap();
+        sequential.put("b", "2").unwrap();
+        sequential.delete("a").unwrap();
+
+        assert_eq!(batched.get(b"a"), sequential.get(b"a"));
+        assert_eq!(batched.get(b"b"), sequential.get(b"b"));
+        assert_eq!(batched.get(b"a"), None);
+        assert_eq!(batched.get(b"b"), Some(b"2".to_vec()));
+    }
+
+    #[test]
+    fn apply_batch_of_empty_ops_is_a_no_op() {
+        let dir = tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        store.put("a", "1").unwrap();
+        store.apply_batch(vec![]).unwrap();
+        assert_eq!(store.get(b"a"), Some(b"1".to_vec()));
+    }
+
+    #[test]
+    fn apply_batch_survives_reopen_exactly_like_sequential_writes() {
+        let dir = tempdir().unwrap();
+        {
+            let mut store = Store::open(dir.path()).unwrap();
+            store
+                .apply_batch(vec![
+                    WriteOp::Put(b"x".to_vec(), b"1".to_vec()),
+                    WriteOp::Put(b"y".to_vec(), b"2".to_vec()),
+                    WriteOp::Delete(b"x".to_vec()),
+                ])
+                .unwrap();
+        }
+        let store = Store::open(dir.path()).unwrap();
+        assert_eq!(store.get(b"x"), None);
+        assert_eq!(store.get(b"y"), Some(b"2".to_vec()));
+        assert!(!store.recovered_from_torn_tail);
+    }
+
+    #[test]
+    fn apply_batch_is_visible_to_scan_and_snapshot_like_individual_writes() {
+        let dir = tempdir().unwrap();
+        let mut store = Store::open(dir.path()).unwrap();
+        store.put("user:1", "alice").unwrap();
+        let snap = store.snapshot();
+
+        store
+            .apply_batch(vec![
+                WriteOp::Put(b"user:2".to_vec(), b"bob".to_vec()),
+                WriteOp::Put(b"user:3".to_vec(), b"carol".to_vec()),
+            ])
+            .unwrap();
+
+        // The snapshot taken before the batch must not see it.
+        assert_eq!(
+            store.scan_at(b"user:", snap),
+            vec![(b"user:1".to_vec(), b"alice".to_vec())]
+        );
+        // A fresh read sees every record the batch wrote, in order.
+        assert_eq!(
+            store.scan(b"user:"),
+            vec![
+                (b"user:1".to_vec(), b"alice".to_vec()),
+                (b"user:2".to_vec(), b"bob".to_vec()),
+                (b"user:3".to_vec(), b"carol".to_vec()),
+            ]
+        );
     }
 
     #[test]
