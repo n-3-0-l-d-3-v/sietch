@@ -217,6 +217,27 @@ impl Log {
         Ok(records)
     }
 
+    /// Writes `records` to the active segment exactly as given — the
+    /// caller supplies each record's `seq` rather than `Log` assigning
+    /// one. Used only by snapshot-aware compaction (ticket 013), which
+    /// must preserve a surviving record's original `seq` so a `Snapshot`
+    /// held across compaction still resolves `get_at`/`scan_at`
+    /// correctly afterward — reassigning fresh sequential seqs (as a
+    /// naive rewrite would) would silently scramble every snapshot's
+    /// notion of "what came before what."
+    pub(crate) fn append_records_verbatim(&mut self, records: &[Record]) -> Result<(), LogError> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let total_len: u64 = records.iter().map(|r| r.encoded_len() as u64).sum();
+        self.roll_over_if_needed(total_len)?;
+        self.active.append_batch(records)?;
+        if let Some(max_seq) = records.iter().map(|r| r.seq).max() {
+            self.next_seq = self.next_seq.max(max_seq + 1);
+        }
+        Ok(())
+    }
+
     pub fn next_seq(&self) -> u64 {
         self.next_seq
     }
@@ -300,6 +321,34 @@ mod tests {
 
         let (_log2, report) = Log::open_with_segment_size(dir.path(), 200).unwrap();
         assert_eq!(report.records.len(), 11);
+    }
+
+    #[test]
+    fn append_records_verbatim_preserves_the_given_seqs_and_bumps_next_seq_past_the_max() {
+        let dir = tempdir().unwrap();
+        let records = vec![
+            Record::put(5, b"a".to_vec(), b"1".to_vec()),
+            Record::put(9, b"b".to_vec(), b"2".to_vec()),
+            Record::delete(20, b"a".to_vec()),
+        ];
+        {
+            let (mut log, _) = Log::open(dir.path()).unwrap();
+            log.append_records_verbatim(&records).unwrap();
+            assert_eq!(log.next_seq(), 21);
+        }
+        let (_log, report) = Log::open(dir.path()).unwrap();
+        assert_eq!(
+            report.records.iter().map(|r| r.seq).collect::<Vec<_>>(),
+            vec![5, 9, 20]
+        );
+    }
+
+    #[test]
+    fn append_records_verbatim_of_an_empty_slice_is_a_no_op() {
+        let dir = tempdir().unwrap();
+        let (mut log, _) = Log::open(dir.path()).unwrap();
+        log.append_records_verbatim(&[]).unwrap();
+        assert_eq!(log.next_seq(), 0);
     }
 
     #[test]
