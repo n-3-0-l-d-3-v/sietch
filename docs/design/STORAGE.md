@@ -206,13 +206,20 @@ documents a real bug (an early design could have destroyed the only valid
 copy of the data during a specific crash-timing edge case) that a test
 caught before it shipped.
 
-**Known limitation**: compaction discards *all* non-latest versions
-unconditionally, including ones an outstanding `Snapshot` might still be
-reading — using `get_at`/`scan_at` against a snapshot taken before a
-compaction will silently return incomplete results. Snapshot-aware
-compaction is ticket 013, not yet started. Compaction currently applies to
-plain `Store` only, not `IndexedStore` or the B+Tree's pages — page-level
-reclamation is separate future work.
+**Snapshot-aware (ticket 013)**: compaction discards non-latest versions
+only for keys no held `Snapshot` needs. `Store::hold_snapshot()` returns
+a `SnapshotGuard`; while any guard is alive, `compact()` retains every
+version at or after the *oldest* held snapshot's sequence number (plus,
+per key, the one version that snapshot itself would resolve to), so
+`get_at`/`scan_at` against a held snapshot are unaffected by a
+compaction that runs while it's open. A `Store` with no held guards
+compacts exactly as before — the original reclaim ratio is unchanged; the
+retention cost is opt-in and visible to whoever holds a guard, not an
+implicit background policy. `TransactionalStore`/`Transaction` hold a
+guard for a transaction's whole lifetime automatically. See
+`docs/design/decisions/ADR-012-snapshot-aware-compaction.md`. Compaction
+still applies to plain `Store` only, not `IndexedStore` or the B+Tree's
+pages — page-level reclamation is separate future work.
 
 ## What this slice does not claim
 

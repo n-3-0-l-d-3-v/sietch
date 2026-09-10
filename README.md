@@ -87,9 +87,23 @@ single-threaded unit test:
 untouched by 4 concurrently racing writer threads. See
 [ADR-011](docs/design/decisions/ADR-011-transactions-snapshot-isolation.md).
 
-See [docs/design/STORAGE.md](docs/design/STORAGE.md) for the architecture
-and [tickets/](tickets/) for what's still open — snapshot-aware
-compaction (ticket 013) — before this phase closes.
+**Ticket 013 (snapshot-aware compaction) is also closed — Phase 2's
+ticket backlog is now fully done.** `Store::hold_snapshot()` returns a
+`SnapshotGuard`; while any guard is held, `compact()` retains every
+version the oldest held snapshot could still need instead of discarding
+all non-latest versions unconditionally, with no change in reclaim ratio
+when nothing is held. Along the way, fixed a sharper defect the same
+rewrite exposed: compaction previously reassigned every surviving
+record a fresh sequence number, silently scrambling snapshot ordering on
+every compaction; `Log::append_records_verbatim` now preserves original
+seqs unconditionally. `TransactionalStore`/`Transaction` hold a guard for
+an open transaction's whole lifetime, so a concurrent compaction can
+never invalidate an in-flight transaction's reads either. See
+[ADR-012](docs/design/decisions/ADR-012-snapshot-aware-compaction.md).
+
+See [docs/design/STORAGE.md](docs/design/STORAGE.md) for the full
+architecture. Phase 2 (THE VAULT) is now feature-complete against its
+original ticket list.
 
 ## The constraint
 

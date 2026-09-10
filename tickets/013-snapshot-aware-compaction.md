@@ -1,5 +1,5 @@
 ---
-status: open
+status: done
 phase: 2
 ---
 
@@ -11,15 +11,36 @@ use, `get_at`/`scan_at` calls against it will silently return incomplete
 or wrong results afterward — the version they need may no longer exist.
 
 ## Scope
-- `Store` needs to track outstanding snapshots (or at least the oldest
-  `as_of_seq` still referenced) so `compact()` can know which versions are
-  still reachable from a live snapshot and must be preserved.
-- Decide the API: does a `Snapshot` need an explicit `drop`/`release` so
-  `Store` knows when it's no longer needed, or does `Store` just keep
-  versions back to some configurable retention horizon?
-- Property test: compacting while a snapshot is held must not change what
-  that snapshot's `get_at`/`scan_at` returns, for arbitrary put/delete
-  sequences interleaved with snapshot creation — the same differential
-  approach as `tests/compaction_property.rs`, extended to cover snapshots.
+- [x] `Store` tracks outstanding snapshots via `Store::hold_snapshot() ->
+      SnapshotGuard` — a refcounted registry (`as_of_seq -> count`) a
+      caller opts into explicitly; `compact()` consults only the oldest
+      currently-held seq. A `Store` with no held guards compacts exactly
+      as before, with unchanged reclaim ratio.
+- [x] API decision: **explicit hold/release** (`SnapshotGuard`, released
+      on `Drop`) rather than an implicit configurable retention horizon —
+      makes the cost of keeping a snapshot alive (what compaction can no
+      longer reclaim) visible and attributable to whoever holds a guard.
+      See `docs/design/decisions/ADR-012-snapshot-aware-compaction.md`.
+- [x] Property test: `tests/compaction_property.rs`'s
+      `compacting_with_a_held_snapshot_never_changes_that_snapshots_reads`
+      — arbitrary put/delete sequences before and after a held snapshot,
+      compaction run in between, checked against a reference model for
+      every key, the same differential approach as the existing
+      compaction property test.
 
-Not started.
+Found and fixed one more defect along the way, not originally scoped but
+a direct consequence of the same rewrite: compaction previously
+reassigned every surviving record a **fresh** sequence number (via the
+ordinary `Log::append_put` path), which silently scrambled any snapshot's
+before/after ordering on every compaction, snapshot held or not. Fixed by
+`Log::append_records_verbatim`, which preserves each surviving record's
+original `seq` — used unconditionally now, not only when a snapshot is
+held.
+
+Also wired `TransactionalStore`/`Transaction` (ticket 007) to hold a
+`SnapshotGuard` for the whole life of an open transaction, so a
+transaction's reads are protected from a concurrent `compact()` call —
+this was flagged as an open gap while writing ADR-012 and closed in the
+same pass rather than left for later.
+
+This closes Phase 2 (THE VAULT)'s ticket backlog.
