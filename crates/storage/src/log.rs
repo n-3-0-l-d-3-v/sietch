@@ -13,6 +13,14 @@ use std::path::{Path, PathBuf};
 use crate::record::Record;
 use crate::segment::{self, Segment};
 
+/// One logical write to batch into a single `fsync` via `append_batch`
+/// (ticket 008 — group commit).
+#[derive(Debug, Clone)]
+pub enum LogOp {
+    Put(Vec<u8>, Vec<u8>),
+    Delete(Vec<u8>),
+}
+
 const DEFAULT_SEGMENT_MAX_BYTES: u64 = 4 * 1024 * 1024;
 const SEGMENT_PREFIX: &str = "seg-";
 const SEGMENT_SUFFIX: &str = ".log";
@@ -170,11 +178,43 @@ impl Log {
     }
 
     fn append(&mut self, record: Record) -> Result<Record, LogError> {
-        let encoded_len = record.encoded_len() as u64;
-        self.roll_over_if_needed(encoded_len)?;
-        self.active.append(&record)?;
-        self.next_seq = record.seq + 1;
-        Ok(record)
+        let op = match record.record_type {
+            crate::record::RecordType::Put => LogOp::Put(record.key, record.value),
+            crate::record::RecordType::Delete => LogOp::Delete(record.key),
+        };
+        Ok(self.append_batch(vec![op])?.remove(0))
+    }
+
+    /// Appends every op in `ops` as its own record, all sharing a single
+    /// trailing `fsync` (ticket 008 — group commit) instead of one per
+    /// record. Sequence numbers are assigned in order, so the batch is
+    /// indistinguishable on replay from the same ops appended one at a
+    /// time — only the durability *cost* changes, not the on-disk format
+    /// or the read semantics.
+    ///
+    /// If this call fails partway through, the whole batch is treated as
+    /// uncommitted: recovery's existing torn-tail handling (ADR-001) does
+    /// not distinguish "a single record was torn" from "a batch of
+    /// records was torn," so no new crash-safety reasoning is needed here
+    /// — see `docs/design/decisions/ADR-010-group-commit.md`.
+    pub fn append_batch(&mut self, ops: Vec<LogOp>) -> Result<Vec<Record>, LogError> {
+        let mut records = Vec::with_capacity(ops.len());
+        let mut seq = self.next_seq;
+        let mut total_len = 0u64;
+        for op in ops {
+            let record = match op {
+                LogOp::Put(key, value) => Record::put(seq, key, value),
+                LogOp::Delete(key) => Record::delete(seq, key),
+            };
+            total_len += record.encoded_len() as u64;
+            seq += 1;
+            records.push(record);
+        }
+
+        self.roll_over_if_needed(total_len)?;
+        self.active.append_batch(&records)?;
+        self.next_seq = seq;
+        Ok(records)
     }
 
     pub fn next_seq(&self) -> u64 {
@@ -217,6 +257,49 @@ mod tests {
 
         let (_log2, report) = Log::open_with_segment_size(dir.path(), 200).unwrap();
         assert_eq!(report.records.len(), 50);
+    }
+
+    #[test]
+    fn append_batch_assigns_sequential_seqs_and_all_records_survive_reopen() {
+        let dir = tempdir().unwrap();
+        {
+            let (mut log, _) = Log::open(dir.path()).unwrap();
+            let records = log
+                .append_batch(vec![
+                    LogOp::Put(b"a".to_vec(), b"1".to_vec()),
+                    LogOp::Put(b"b".to_vec(), b"2".to_vec()),
+                    LogOp::Delete(b"a".to_vec()),
+                ])
+                .unwrap();
+            assert_eq!(
+                records.iter().map(|r| r.seq).collect::<Vec<_>>(),
+                vec![0, 1, 2]
+            );
+            assert_eq!(log.next_seq(), 3);
+        }
+        let (_log, report) = Log::open(dir.path()).unwrap();
+        assert_eq!(report.records.len(), 3);
+    }
+
+    #[test]
+    fn append_batch_that_would_overflow_the_segment_rolls_over_first() {
+        let dir = tempdir().unwrap();
+        let (mut log, _) = Log::open_with_segment_size(dir.path(), 200).unwrap();
+        log.append_put(b"warm".to_vec(), vec![0u8; 20]).unwrap();
+        let before_segments = log.segment_count();
+
+        // A batch bigger than what's left in the current segment.
+        let ops: Vec<LogOp> = (0..10)
+            .map(|i| LogOp::Put(format!("k{i}").into_bytes(), vec![0u8; 20]))
+            .collect();
+        log.append_batch(ops).unwrap();
+        assert!(
+            log.segment_count() > before_segments,
+            "an oversized batch should trigger a rollover"
+        );
+
+        let (_log2, report) = Log::open_with_segment_size(dir.path(), 200).unwrap();
+        assert_eq!(report.records.len(), 11);
     }
 
     #[test]
