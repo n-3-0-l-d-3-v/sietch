@@ -94,12 +94,31 @@ impl Segment {
     /// Appends one record and fsyncs it before returning — a record is
     /// never reported as written until it is durable.
     pub fn append(&mut self, record: &Record) -> io::Result<u64> {
-        let bytes = record.encode();
-        self.file.write_all(&bytes)?;
+        let offsets = self.append_batch(std::slice::from_ref(record))?;
+        Ok(offsets[0])
+    }
+
+    /// Appends every record in `records` with a single trailing `fsync`,
+    /// instead of one per record (ticket 008 — group commit). Returns
+    /// each record's starting offset, in order. None of them are durable
+    /// until this call returns `Ok`; if it returns `Err`, some prefix of
+    /// the batch's bytes may have reached the OS but the whole batch must
+    /// be treated as not committed — recovery's existing torn-tail
+    /// handling (`recover`, ADR-001) covers exactly this case, because a
+    /// batch that didn't finish `fsync`-ing is indistinguishable from any
+    /// other torn write.
+    pub fn append_batch(&mut self, records: &[Record]) -> io::Result<Vec<u64>> {
+        let mut offsets = Vec::with_capacity(records.len());
+        let mut offset = self.len;
+        for record in records {
+            let bytes = record.encode();
+            self.file.write_all(&bytes)?;
+            offsets.push(offset);
+            offset += bytes.len() as u64;
+        }
         self.file.sync_data()?;
-        let offset = self.len;
-        self.len += bytes.len() as u64;
-        Ok(offset)
+        self.len = offset;
+        Ok(offsets)
     }
 }
 
@@ -152,6 +171,38 @@ mod tests {
         let recovered_again = recover(&path).unwrap();
         assert_eq!(recovered_again.records.len(), 2);
         assert!(!recovered_again.had_torn_tail);
+    }
+
+    #[test]
+    fn append_batch_writes_all_records_recoverable_with_correct_offsets() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("seg-0.log");
+        let mut seg = Segment::open_for_append(path.clone(), 0).unwrap();
+        let records = vec![
+            Record::put(1, b"a".to_vec(), b"1".to_vec()),
+            Record::put(2, b"b".to_vec(), b"2".to_vec()),
+            Record::delete(3, b"a".to_vec()),
+        ];
+        let offsets = seg.append_batch(&records).unwrap();
+        assert_eq!(offsets[0], 0);
+        assert_eq!(offsets[1], records[0].encoded_len() as u64);
+        assert_eq!(offsets[2], offsets[1] + records[1].encoded_len() as u64);
+
+        let recovered = recover(&path).unwrap();
+        assert_eq!(recovered.records, records);
+        assert!(!recovered.had_torn_tail);
+    }
+
+    #[test]
+    fn append_batch_of_one_matches_single_append() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("seg-0.log");
+        let mut seg = Segment::open_for_append(path.clone(), 0).unwrap();
+        let record = Record::put(1, b"k".to_vec(), b"v".to_vec());
+        let offset = seg.append_batch(std::slice::from_ref(&record)).unwrap()[0];
+        assert_eq!(offset, 0);
+        let recovered = recover(&path).unwrap();
+        assert_eq!(recovered.records, vec![record]);
     }
 
     #[test]
