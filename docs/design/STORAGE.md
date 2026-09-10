@@ -70,9 +70,27 @@ persisted, and rebuilt from the log on reopen). The in-memory index keeps
 every version of every key (`Vec<VersionEntry>`), not just the latest. A
 `Snapshot` is just a captured `seq` value; `get_at`/`scan_at` walk backward
 through a key's version list to find the version visible as of that
-`seq`. This is genuine multi-version concurrency control in miniature —
-not a full transaction system yet (no write-write conflict detection,
-single-writer only in this slice — see ticket 007).
+`seq`. This is genuine multi-version concurrency control.
+
+## Transactions (ticket 007)
+
+`crates/storage/src/txn.rs`'s `TransactionalStore`/`Transaction` build
+Snapshot Isolation directly on top of the `Snapshot`/`get_at`/
+`apply_batch` primitives above, rather than a separate mechanism:
+`TransactionalStore` wraps a plain `Store` in `Arc<Mutex<Store>>` (the
+handle multiple threads actually share); `Transaction::begin` takes a
+snapshot and buffers reads/writes purely in memory; `commit` checks every
+written key's latest committed `seq` against the transaction's snapshot
+(first-committer-wins), and only if nothing conflicts applies every
+buffered write in one `apply_batch` call — one `fsync` for a whole
+multi-key transaction. A conflict aborts the entire transaction, nothing
+partial. See
+`docs/design/decisions/ADR-011-transactions-snapshot-isolation.md` and
+`crates/storage/tests/concurrency.rs` (real multi-threaded lost-update
+and snapshot-isolation-under-contention tests) for the details and the
+measured proof this holds under actual thread contention, not just in a
+single-threaded unit test. Full serializability (write skew is possible)
+and multi-process coordination remain explicitly out of scope.
 
 ## Pages and the buffer manager
 
@@ -212,7 +230,11 @@ reclamation is separate future work.
   (4096 bytes each) still accumulates forever in `HeapPageStore`'s heap
   file, and a deleted slot's bytes are never reclaimed within a page
   either.
-- Single-writer only; no locking or multi-process coordination.
+- Single-process only; `TransactionalStore`'s `Mutex` coordinates threads
+  within one process, not across processes or machines. `Transaction`
+  gives Snapshot Isolation, not full serializability — write skew is
+  possible, as with any SI implementation, and is a known trade-off, not
+  a bug. `IndexedStore` has no transactional wrapper yet, only `Store`.
 - `fsync` per record (and therefore per dirty page flush) makes every
   individual `put`/`delete` durable but limits throughput — measured at
   ~1ms/put for keys (`append_throughput.rs`) and ~1ms per dirty page

@@ -1,5 +1,5 @@
 ---
-status: open
+status: done
 phase: 2
 ---
 
@@ -13,13 +13,28 @@ guarantees, deliberately forcing conflicts, crashes, retries, and stale
 snapshots.
 
 ## Scope
-- Multi-operation transactions (begin/commit/abort) with at least Read
-  Committed, ideally Snapshot Isolation (the `Snapshot` type already here
-  is a building block).
-- Concurrent-client test harness: N threads/processes hammering the same
-  store, asserting the documented isolation level actually holds.
-- Write-write conflict detection under Snapshot Isolation (first-committer-
-  wins or similar).
+- [x] Multi-operation transactions (begin/commit/abort) with Snapshot
+      Isolation: `TransactionalStore`/`Transaction` in
+      `crates/storage/src/txn.rs`, built on the existing `Snapshot`/
+      `get_at`/`apply_batch` primitives rather than a new mechanism. See
+      `docs/design/decisions/ADR-011-transactions-snapshot-isolation.md`.
+- [x] Concurrent-client test harness: `crates/storage/tests/concurrency.rs`
+      runs real OS threads against one shared store — a lost-update test
+      (8 threads × 25 retry-on-conflict increments to a shared counter,
+      final value exactly 200), a snapshot-isolation-under-contention test
+      (a reader's snapshot is unaffected by 4 concurrently racing writer
+      threads), and a disjoint-keys-never-conflict test.
+- [x] Write-write conflict detection, first-committer-wins:
+      `Transaction::commit` checks every written key's latest committed
+      sequence number against the transaction's snapshot; any conflict
+      aborts the whole transaction (nothing partial is ever applied).
 
-Not started. This is the natural on-ramp to Phase 6 (`choam`),
-which needs real transactions and MVCC on top of this exact storage engine.
+Deliberately out of scope, tracked as open follow-ups rather than
+silently assumed done: full serializability (write skew is possible
+under SI, as is standard), multi-process coordination (the `Mutex` in
+`TransactionalStore` only coordinates threads within one process), and
+a transactional wrapper for `IndexedStore` (only plain `Store` has one).
+
+This is the on-ramp ticket for Phase 6 (`choam`), which needs real
+transactions and MVCC on top of this exact storage engine — `choam` can
+build on `TransactionalStore` directly.

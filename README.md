@@ -75,10 +75,21 @@ batched write pays roughly one fixed `fsync` cost regardless of how many
 records share it. See
 [ADR-010](docs/design/decisions/ADR-010-group-commit.md).
 
+**Ticket 007 (transactions and concurrency) is also closed.**
+`TransactionalStore`/`Transaction` (`crates/storage/src/txn.rs`) give
+Snapshot Isolation with write-write conflict detection, built directly on
+the existing `Snapshot`/`get_at`/`apply_batch` primitives — no separate
+transaction log needed. Proven with real OS threads, not just a
+single-threaded unit test:
+`crates/storage/tests/concurrency.rs`'s lost-update test runs 8 threads
+× 25 retry-on-conflict increments to one shared counter and gets exactly
+200 back, and its snapshot-isolation test confirms a reader's snapshot is
+untouched by 4 concurrently racing writer threads. See
+[ADR-011](docs/design/decisions/ADR-011-transactions-snapshot-isolation.md).
+
 See [docs/design/STORAGE.md](docs/design/STORAGE.md) for the architecture
-and [tickets/](tickets/) for what's still open — transactions/concurrency
-and snapshot-aware compaction (tickets 007, 013) — before this phase
-closes.
+and [tickets/](tickets/) for what's still open — snapshot-aware
+compaction (ticket 013) — before this phase closes.
 
 ## The constraint
 
